@@ -127,6 +127,55 @@ The trained checkpoints of `MVTec, setting [s], task [t]` are saved under `./inc
 The test results are saved under `./Test/`
 
 
+## 6. Experimental Details Checklist (for papers)
+Besides the pre-trained Stable Diffusion checkpoint, the following values can be directly reported from this repo.
+
+### 6.1 Data protocol (filled)
+- Dataset and root path:
+  - MVTec-AD: `./data/mvtec_anomaly_detection`
+  - VisA: `./data/VisA`
+- Incremental setting id: `--setting` (see the setting table in Section 4).
+- Test checkpoint path format:
+  - MVTec: `./incre_val/mvtec_setting[s]/task[t]_best.ckpt`
+  - VisA: `./incre_val/visa_setting[s]/task[t]_best.ckpt`
+
+### 6.2 Optimization and training schedule (filled)
+- Random seed: `--seed=1`.
+- Batch size: `--batch_size=12`.
+- GPM statistics batch size: `--gpm_batch_size=1`.
+- Learning rate: `--learning_rate=1e-5`.
+- Max epoch: `--max_epoch=500`.
+- Validation frequency:
+  - MVTec: `--check_v=25`
+  - VisA: `--check_v=5`
+- Training precision/device: PyTorch Lightning `gpus=1`, `precision=32`.
+
+### 6.3 Diffusion/CDAD model hyperparameters (filled)
+- Diffusion process: `timesteps=1000`, `linear_start=0.00085`, `linear_end=0.012`, `num_timesteps_cond=1`.
+- Model scale: `image_size=64`, `channels=4`, `scale_factor=0.18215`.
+- Feature distance: `distance='eucl'`.
+- Feature layers for anomaly scoring:
+  - MVTec: `layers=[1,2,3]`
+  - VisA: `layers=[0,2,4]`
+- AMN/control settings: `neighbor_size=[7,7]`, `hint_channels=3`, `model_channels=320`.
+
+### 6.4 Continual additive LoRA expert settings (filled)
+- `lora_rank=4`
+- `lora_alpha=1.0`
+- `orth_lambda=1e-4`
+- `novelty_threshold=0.2`
+- Historical experts are frozen during continual updates; inference uses `fuse_lora_experts()` (if available) before testing.
+
+### 6.5 Evaluation protocol (filled)
+- Checkpoint selection: `ModelCheckpoint(monitor='val_acc', mode='max', filename='task{i}_best')`.
+- Metrics reported in test scripts: APSP-AUC and PRO-AUC.
+- Anomaly map post-processing: Gaussian smoothing `sigma=5`.
+- Suggested reporting format: per-task + average across tasks (and optionally forgetting/BWT).
+
+### 6.6 Recommended table fields in your paper
+`dataset | setting id | task id | seed | lr | batch size | gpm batch size | max epoch | check_v | LoRA rank | lora alpha | orth lambda | novelty threshold | checkpoint rule | metrics`.
+
+
 
 ## Citation
 
