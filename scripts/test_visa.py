@@ -27,6 +27,8 @@ def main(args):
 
     weights = torch.load(resume_path)
     model.load_state_dict(weights, strict=False)
+    if hasattr(model, "fuse_lora_experts"):
+        model.fuse_lora_experts()
 
     # Misc
     dataset, _ = VisaDataset_cad('test', args.data_path, args.setting)
