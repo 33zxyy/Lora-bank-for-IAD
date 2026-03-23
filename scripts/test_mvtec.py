@@ -16,7 +16,6 @@ from tqdm import tqdm
 from data.mvtecad_dataloader import MVTecDataset_cad
 
 def main(args):
-
     resume_path = f'./incre_val/mvtec_setting{args.setting}/task{args.task}_best.ckpt'
 
     setup_seed(args.seed)
@@ -27,6 +26,8 @@ def main(args):
 
     weights = torch.load(resume_path)
     model.load_state_dict(weights, strict=False)
+    if hasattr(model, "fuse_lora_experts"):
+        model.fuse_lora_experts()
 
     # Misc
     dataset, _ = MVTecDataset_cad('test', args.data_path, args.setting)
@@ -36,7 +37,7 @@ def main(args):
 
     model.eval()
 
-    result = {'clsname':[], 'filename':[], 'pred':[], 'mask':[], 'input':[]}
+    result = {'clsname': [], 'filename': [], 'pred': [], 'mask': [], 'input': []}
 
     evl_dir = "TEST/mvtec"
     os.makedirs(f"{evl_dir}/image", exist_ok=True)
@@ -59,7 +60,8 @@ def main(args):
             input_features = [input_features[i] for i in model.layers_]
             output_features = [output_features[i] for i in model.layers_]
 
-            anomaly_map, _ = cal_anomaly_map(input_features, output_features, input_img.shape[-1], amap_mode='a', dis=model.distance)
+            anomaly_map, _ = cal_anomaly_map(input_features, output_features, input_img.shape[-1], amap_mode='a',
+                                             dis=model.distance)
 
             for i in range(anomaly_map.shape[0]):
                 anomaly_map[i] = gaussian_filter(anomaly_map[i], sigma=5)
@@ -67,9 +69,9 @@ def main(args):
             anomaly_map = torch.from_numpy(anomaly_map)
             anomaly_map_prediction = anomaly_map.unsqueeze(dim=1)
 
-            result['filename'] += input["filename"]           # list:12
-            result['pred'] += list(anomaly_map_prediction.cpu().numpy())     # B x 1 x H x W
-            result['mask'] += list(input["mask"].cpu().numpy())     # B x 1 x H x W
+            result['filename'] += input["filename"]  # list:12
+            result['pred'] += list(anomaly_map_prediction.cpu().numpy())  # B x 1 x H x W
+            result['mask'] += list(input["mask"].cpu().numpy())  # B x 1 x H x W
             result['clsname'] += input["clsname"]
             result['input'] += list(input['jpg'].numpy())
 
@@ -86,8 +88,9 @@ def main(args):
 
             anomaly_map = torch.from_numpy(pred_feature[i][0, :, :])
 
-            #Heatmap
-            anomaly_map_new = np.round(255.0 * ((anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())))
+            # Heatmap
+            anomaly_map_new = np.round(
+                255.0 * ((anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min())))
 
             anomaly_map_new = anomaly_map_new.cpu().numpy().astype(np.uint8)
 
@@ -101,12 +104,11 @@ def main(args):
             heatmap_name = "{}-heatmap.png".format(name)
             cv2.imwrite(root + result["filename"][i][:-7] + heatmap_name, out_heat_map)
 
-
     print("Gathering final results ...")
 
     # evl_metrics = {'auc': [{'name': 'max'}, {'name': 'pixel'}, {'name': 'pro'}, {'name': 'apsp'}]}
     evl_metrics = {'auc': [{'name': 'apsp'}, {'name': 'pro'}]}
-    
+
     fileinfos, preds, masks = merge_together(result)
 
     ret_metrics = performances(fileinfos, preds, masks, evl_metrics)
@@ -117,7 +119,6 @@ def main(args):
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(description="CDAD")
 
     parser.add_argument("--data_path", default="./data/mvtec_anomaly_detection", type=str)
@@ -133,6 +134,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
-
-

@@ -47,8 +47,12 @@ model:
     linear_start: 0.00085
     log_every_t: 200
     log_name: encoder_decoder_4-23_woTimemb
+    lora_alpha: 1.0
+    lora_rank: 4
     monitor: val/loss_simple_ema
+    novelty_threshold: 0.2
     num_timesteps_cond: 1
+    orth_lambda: 0.0001
     scale_factor: 0.18215
     timesteps: 1000
     unet_config:
@@ -76,4 +80,3 @@ model:
       target: cdm.amn.ControlledUnetModel
     use_ema: false
   target: cdm.gpm.CDAD
-
