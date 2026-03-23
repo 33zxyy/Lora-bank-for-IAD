@@ -147,12 +147,15 @@ class CheckpointFunction(torch.autograd.Function):
                 grad_targets.append(tensor)
                 grad_target_indices.append(idx)
 
-        computed_grads = torch.autograd.grad(
-            output_tensors,
-            grad_targets,
-            output_grads,
-            allow_unused=True,
-        )
+        if grad_targets:
+            computed_grads = torch.autograd.grad(
+                output_tensors,
+                grad_targets,
+                output_grads,
+                allow_unused=True,
+            )
+        else:
+            computed_grads = ()
 
         input_grads = [None] * len(all_inputs)
         for idx, grad in zip(grad_target_indices, computed_grads):
@@ -160,7 +163,7 @@ class CheckpointFunction(torch.autograd.Function):
         del ctx.input_tensors
         del ctx.input_params
         del output_tensors
-        return (None, None) + input_grads
+        return (None, None) + tuple(input_grads)
 
 
 def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
