@@ -139,12 +139,24 @@ class CheckpointFunction(torch.autograd.Function):
             # Tensors.
             shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
             output_tensors = ctx.run_function(*shallow_copies)
-        input_grads = torch.autograd.grad(
+        grad_targets = []
+        grad_target_indices = []
+        all_inputs = ctx.input_tensors + ctx.input_params
+        for idx, tensor in enumerate(all_inputs):
+            if tensor.requires_grad:
+                grad_targets.append(tensor)
+                grad_target_indices.append(idx)
+
+        computed_grads = torch.autograd.grad(
             output_tensors,
-            ctx.input_tensors + ctx.input_params,
+            grad_targets,
             output_grads,
             allow_unused=True,
         )
+
+        input_grads = [None] * len(all_inputs)
+        for idx, grad in zip(grad_target_indices, computed_grads):
+            input_grads[idx] = grad
         del ctx.input_tensors
         del ctx.input_params
         del output_tensors
