@@ -22,7 +22,7 @@ from torchvision.utils import make_grid
 from ldm.modules.diffusionmodules.openaimodel import UNetModel
 from cdm.vit import *
 
-
+123
 class ControlledUnetModel(UNetModel):
     def forward(self, x, timesteps=None, context=None, control=None, **kwargs):
         hs = []
