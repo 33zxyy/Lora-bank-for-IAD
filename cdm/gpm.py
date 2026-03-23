@@ -26,7 +26,7 @@ class CDAD(SD_AMN):
     The implementation of GPM and iSVD
     """
 
-        def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2, *args, **kwargs):
+    def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
             self.act = {}
