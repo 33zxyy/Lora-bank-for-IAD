@@ -22,7 +22,14 @@ def main(args):
     weights = load_state_dict(args.resume_path, location='cpu')
     # Keep backward-compatible behavior for base initialization.
     if args.start_task == 0 and args.resume_path.endswith('base.ckpt'):
-        select_weights = {key: weights[key] for key in weights if not 'control_model' in key}
+        # For fresh starts, allow changing LoRA rank without shape mismatch by
+        # skipping persisted LoRA expert tensors from base checkpoints.
+        select_weights = {
+            key: weights[key] for key in weights
+            if ('control_model' not in key
+                and '.experts.' not in key
+                and '.expert_gates.' not in key)
+        }
         model.load_state_dict(select_weights, strict=False)
     else:
         model.load_state_dict(weights, strict=False)
@@ -94,7 +101,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
 
 
 
