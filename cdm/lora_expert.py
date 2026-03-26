@@ -29,7 +29,7 @@ class AdditiveLoRAAdapter(nn.Module):
 
     def add_expert(self, trainable: bool = True):
         with torch.inference_mode(False):
-            a=nn.Parameter(torch.zerros(self.rank,self.in_dim))
+            a=nn.Parameter(torch.zeros(self.rank,self.in_dim))
             b=nn.Parameter(torch.zeros(self.out_dim,self.rank))
             nn.init.kaiming_uniform_(a,a=5 ** 0.5)
             nn.init.zeros_(b)
