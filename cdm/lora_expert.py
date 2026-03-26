@@ -28,12 +28,12 @@ class AdditiveLoRAAdapter(nn.Module):
         self.out_dim = out_dim
 
     def add_expert(self, trainable: bool = True):
-        a = nn.Parameter(torch.zeros(self.rank, self.in_dim))
-        b = nn.Parameter(torch.zeros(self.out_dim, self.rank))
-        nn.init.kaiming_uniform_(a, a=5 ** 0.5)
-        nn.init.zeros_(b)
-
-        gate = nn.Parameter(torch.tensor(1.0))
+        with torch.inference_mode(False):
+            a=nn.Parameter(torch.zerros(self.rank,self.in_dim))
+            b=nn.Parameter(torch.zeros(self.out_dim,self.rank))
+            nn.init.kaiming_uniform_(a,a=5 ** 0.5)
+            nn.init.zeros_(b)
+            gate=nn.Parameter(torch.tensor(1.0))
         a.requires_grad = trainable
         b.requires_grad = trainable
         gate.requires_grad = trainable
