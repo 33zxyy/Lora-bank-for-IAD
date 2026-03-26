@@ -19,16 +19,23 @@ def main(args):
 
     model = create_model('models/cdad_mvtec.yaml').cpu()
 
-    weights = torch.load(args.resume_path)
-    select_weights = {key: weights[key] for key in weights if not 'control_model' in key}
-    model.load_state_dict(select_weights, strict=False)
+    weights = load_state_dict(args.resume_path, location='cpu')
+    # Keep backward-compatible behavior for base initialization.
+    if args.start_task == 0 and args.resume_path.endswith('base.ckpt'):
+        select_weights = {key: weights[key] for key in weights if not 'control_model' in key}
+        model.load_state_dict(select_weights, strict=False)
+    else:
+        model.load_state_dict(weights, strict=False)
 
     model.learning_rate = args.learning_rate
 
     train_dataset, task_num = MVTecDataset_cad('train', args.data_path, args.setting)
     test_dataset, _ = MVTecDataset_cad('test', args.data_path, args.setting)
 
-    for i in range(task_num):
+    if args.start_task < 0 or args.start_task >= task_num:
+        raise ValueError(f"start_task must be in [0, {task_num - 1}], got {args.start_task}")
+
+    for i in range(args.start_task, task_num):
 
         model.set_log_name(log_name + f'/task{i}')
 
@@ -69,6 +76,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--setting", default=1, type=int)
 
+    parser.add_argument("--start_task", default=0, type=int,
+                        help="Task index to start/resume from, e.g., 1 means start from task1.")
+
     parser.add_argument("--seed", default=1, type=int)
 
     parser.add_argument("--batch_size", default=12, type=int)
@@ -84,7 +94,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
 
 
 
