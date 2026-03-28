@@ -26,7 +26,10 @@ class CDAD(SD_AMN):
     The implementation of GPM and iSVD
     """
 
-    def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2, *args, **kwargs):
+    def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
+                 init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
+                 orth_constraint_mode="soft", adaptive_init_on_task0=False,
+                 *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
             self.act = {}
@@ -34,9 +37,23 @@ class CDAD(SD_AMN):
             self.lora_alpha = lora_alpha
             self.orth_lambda = orth_lambda
             self.novelty_threshold = novelty_threshold
+            self.init_experts = init_experts
+            self.max_experts_per_layer = max_experts_per_layer
+            self.max_new_experts_per_task = max_new_experts_per_task
+            self.novelty_step = novelty_step
+            self.adaptive_init_on_task0 = adaptive_init_on_task0
+            if orth_constraint_mode not in ("soft", "hard"):
+                raise ValueError(f"orth_constraint_mode must be 'soft' or 'hard', got {orth_constraint_mode}")
+            self.orth_constraint_mode = orth_constraint_mode
             self.layer_adapters = {}
             self._attach_lora_adapters()
-            self._append_new_expert(trainable=True)
+            init_num_experts = self.init_experts
+            if self.adaptive_init_on_task0:
+                # Before task0 we do not have previous task statistics yet.
+                # Use maximal novelty proxy (1.0) with the same growth rule.
+                init_num_experts = self._compute_new_experts_from_novelty(1.0, current_experts=0)
+                init_num_experts = max(init_num_experts, 1)
+            self._append_new_expert(trainable=True, num_new_experts=init_num_experts, freeze_previous=False)
 
     def _attach_lora_adapters(self):
         target_names = set(self.unet_train_param_name + self.control_train_param_name)
@@ -59,11 +76,14 @@ class CDAD(SD_AMN):
                 setattr(parent, attr_name, adapter)
                 self.layer_adapters[f"control::{name}"] = adapter
 
-    def _append_new_expert(self, trainable=True):
+    def _append_new_expert(self, trainable=True, num_new_experts=1, freeze_previous=True):
+        if num_new_experts <= 0:
+            return
         for adapter in self.layer_adapters.values():
-            if adapter.num_experts > 0:
+            if freeze_previous and adapter.num_experts > 0:
                 adapter.freeze_expert(adapter.num_experts - 1)
-            adapter.add_expert(trainable=trainable)
+            for _ in range(num_new_experts):
+                adapter.add_expert(trainable=trainable)
 
     def _orthogonal_regularization(self):
         if not self.layer_adapters:
@@ -82,6 +102,38 @@ class CDAD(SD_AMN):
         if len(energies) == 0:
             return 0.0
         return float(sum(energies) / len(energies))
+
+    def _compute_new_experts_from_novelty(self, novelty, current_experts):
+        if novelty <= self.novelty_threshold:
+            return 0
+        step = max(self.novelty_step, 1e-8)
+        num_new_experts = 1 + int((novelty - self.novelty_threshold) / step)
+        num_new_experts = min(num_new_experts, self.max_new_experts_per_task)
+
+        if self.max_experts_per_layer is not None:
+            room = max(self.max_experts_per_layer - current_experts, 0)
+            num_new_experts = min(num_new_experts, room)
+        return max(num_new_experts, 0)
+
+    @torch.no_grad()
+    def _apply_hard_orthogonal_constraint(self):
+        for adapter in self.layer_adapters.values():
+            if adapter.num_experts <= 1:
+                continue
+            latest_idx = adapter.num_experts - 1
+            a_latest = adapter.get_a(latest_idx)
+            u_prev = adapter.orth_basis(upto=latest_idx)
+            if u_prev is None or u_prev.numel() == 0:
+                continue
+            # Hard-constraint: explicitly remove the component in the previous
+            # expert subspace so the newest expert focuses on novel directions.
+            proj = (a_latest @ u_prev.t()) @ u_prev
+            residual = a_latest - proj
+            old_norm = torch.norm(a_latest, p='fro')
+            new_norm = torch.norm(residual, p='fro')
+            if new_norm > 1e-12:
+                residual = residual * (old_norm / new_norm)
+            a_latest.data.copy_(residual)
 
     def configure_optimizers(self):
         lr = self.learning_rate
@@ -129,7 +181,10 @@ class CDAD(SD_AMN):
 
         loss, loss_dict = self.shared_step(batch)
         orth_loss = self._orthogonal_regularization()
-        total_loss = loss + self.orth_lambda * orth_loss
+        if self.orth_constraint_mode == "soft":
+            total_loss = loss + self.orth_lambda * orth_loss
+        else:
+            total_loss = loss
 
         self.log_dict(loss_dict, prog_bar=True,
                       logger=True, on_step=True, on_epoch=True)
@@ -145,6 +200,8 @@ class CDAD(SD_AMN):
         opt.zero_grad()
         self.manual_backward(total_loss)
         opt.step()
+        if self.orth_constraint_mode == "hard":
+            self._apply_hard_orthogonal_constraint()
 
     def get_activation(self, name):
         def hook(model, input, output):
@@ -198,13 +255,21 @@ class CDAD(SD_AMN):
     def on_test_end(self):
         novelty = self._novelty_energy()
         grow = novelty > self.novelty_threshold
-        if grow:
-            self._append_new_expert(trainable=True)
+        current = 0
+        if len(self.layer_adapters) > 0:
+            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
+        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current) if grow else 0
+
+        if num_new_experts > 0:
+            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
 
         for value in self.hook_handle.values():
             value.remove()
 
-        self.logger_val.info(f"LoRA novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, grow={grow}")
+        self.logger_val.info(
+            f"LoRA novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
+            f"grow={grow}, new_experts={num_new_experts}"
+        )
         self.task_id += 1
         self.max_check = 0.0
 
