@@ -26,7 +26,9 @@ class CDAD(SD_AMN):
     The implementation of GPM and iSVD
     """
 
-    def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2, *args, **kwargs):
+    def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
+                 init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
+                 *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
             self.act = {}
@@ -34,9 +36,13 @@ class CDAD(SD_AMN):
             self.lora_alpha = lora_alpha
             self.orth_lambda = orth_lambda
             self.novelty_threshold = novelty_threshold
+            self.init_experts = init_experts
+            self.max_experts_per_layer = max_experts_per_layer
+            self.max_new_experts_per_task = max_new_experts_per_task
+            self.novelty_step = novelty_step
             self.layer_adapters = {}
             self._attach_lora_adapters()
-            self._append_new_expert(trainable=True)
+            self._append_new_expert(trainable=True, num_new_experts=self.init_experts, freeze_previous=False)
 
     def _attach_lora_adapters(self):
         target_names = set(self.unet_train_param_name + self.control_train_param_name)
@@ -59,11 +65,14 @@ class CDAD(SD_AMN):
                 setattr(parent, attr_name, adapter)
                 self.layer_adapters[f"control::{name}"] = adapter
 
-    def _append_new_expert(self, trainable=True):
+    def _append_new_expert(self, trainable=True, num_new_experts=1, freeze_previous=True):
+        if num_new_experts <= 0:
+            return
         for adapter in self.layer_adapters.values():
-            if adapter.num_experts > 0:
+            if freeze_previous and adapter.num_experts > 0:
                 adapter.freeze_expert(adapter.num_experts - 1)
-            adapter.add_expert(trainable=trainable)
+            for _ in range(num_new_experts):
+                adapter.add_expert(trainable=trainable)
 
     def _orthogonal_regularization(self):
         if not self.layer_adapters:
@@ -198,13 +207,29 @@ class CDAD(SD_AMN):
     def on_test_end(self):
         novelty = self._novelty_energy()
         grow = novelty > self.novelty_threshold
+        num_new_experts = 0
         if grow:
-            self._append_new_expert(trainable=True)
+            step = max(self.novelty_step, 1e-8)
+            num_new_experts = 1 + int((novelty - self.novelty_threshold) / step)
+            num_new_experts = min(num_new_experts, self.max_new_experts_per_task)
+
+            if self.max_experts_per_layer is not None:
+                current = 0
+                if len(self.layer_adapters) > 0:
+                    current = min(adapter.num_experts for adapter in self.layer_adapters.values())
+                room = max(self.max_experts_per_layer - current, 0)
+                num_new_experts = min(num_new_experts, room)
+
+        if num_new_experts > 0:
+            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
 
         for value in self.hook_handle.values():
             value.remove()
 
-        self.logger_val.info(f"LoRA novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, grow={grow}")
+        self.logger_val.info(
+            f"LoRA novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
+            f"grow={grow}, new_experts={num_new_experts}"
+        )
         self.task_id += 1
         self.max_check = 0.0
 

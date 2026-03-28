@@ -49,6 +49,10 @@ model:
     log_name: encoder_decoder_4-23_woTimemb
     lora_alpha: 1.0
     lora_rank: 4
+    init_experts: 1
+    max_experts_per_layer: 8
+    max_new_experts_per_task: 2
+    novelty_step: 0.1
     monitor: val/loss_simple_ema
     novelty_threshold: 0.2
     num_timesteps_cond: 1
