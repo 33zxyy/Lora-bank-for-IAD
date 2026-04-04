@@ -126,6 +126,23 @@ The trained checkpoints of `MVTec, setting [s], task [t]` are saved under `./inc
 
 The test results are saved under `./Test/`
 
+## 6. Create an extra GitHub repository from current code version
+
+If you need to create an extra GitHub repository based on the **current local code version** (for example, repo name: `original-cdad`), use:
+
+```bash
+GITHUB_OWNER=<your_github_user_or_org> \
+GITHUB_TOKEN=<your_personal_access_token> \
+REPO_NAME=original-cdad \
+VISIBILITY=public \
+bash scripts/create_github_repo.sh
+```
+
+Notes:
+- `GITHUB_TOKEN` should have permission to create repositories and push code.
+- The script will try to create the repository first, then set local `origin`, and finally push the current branch.
+- If the repository already exists, the script still attempts to push current branch content to it.
+
 
 
 ## Citation
