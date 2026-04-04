@@ -1,6 +1,5 @@
 import sys
 import os
-
 sys.path.append(os.getcwd())
 from share import *
 from utils.util import *
@@ -23,7 +22,14 @@ def main(args):
     weights = load_state_dict(args.resume_path, location='cpu')
     # Keep backward-compatible behavior for base initialization.
     if args.start_task == 0 and args.resume_path.endswith('base.ckpt'):
-        select_weights = {key: weights[key] for key in weights if not 'control_model' in key}
+        # For fresh starts, allow changing LoRA rank without shape mismatch by
+        # skipping persisted LoRA expert tensors from base checkpoints.
+        select_weights = {
+            key: weights[key] for key in weights
+            if ('control_model' not in key
+                and '.experts.' not in key
+                and '.expert_gates.' not in key)
+        }
         model.load_state_dict(select_weights, strict=False)
     else:
         model.load_state_dict(weights, strict=False)
@@ -37,6 +43,7 @@ def main(args):
         raise ValueError(f"start_task must be in [0, {task_num - 1}], got {args.start_task}")
 
     for i in range(args.start_task, task_num):
+
         model.set_log_name(log_name + f'/task{i}')
 
         ckpt_callback_val = ModelCheckpoint(
@@ -46,13 +53,14 @@ def main(args):
             mode='max')
 
         trainer = pl.Trainer(gpus=1, precision=32,
-                             callbacks=[ckpt_callback_val, ],
-                             num_sanity_val_steps=0,
-                             accumulate_grad_batches=1,  # Do not change!!!
-                             max_epochs=args.max_epoch,
-                             check_val_every_n_epoch=args.check_v,
-                             enable_progress_bar=False
-                             )
+                    callbacks=[ckpt_callback_val, ],
+                    num_sanity_val_steps=0,
+                    accumulate_grad_batches=1,     # Do not change!!!
+                    max_epochs=args.max_epoch,
+                    check_val_every_n_epoch=args.check_v,
+                    enable_progress_bar=False
+                    )
+
 
         train_dataloader = DataLoader(train_dataset[i], num_workers=8, batch_size=args.batch_size, shuffle=True)
         gpm_dataloader = DataLoader(train_dataset[i], num_workers=8, batch_size=args.gpm_batch_size, shuffle=False)
@@ -60,14 +68,17 @@ def main(args):
 
         trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=test_dataloader)
 
-        model.load_state_dict(load_state_dict(trainer.checkpoint_callback.best_model_path, location='cuda'),
-                              strict=False)
+        best_model_path = ckpt_callback_val.best_model_path
+        if not best_model_path:
+            raise RuntimeError(f"No best checkpoint found for task {i}.")
+        print(f"[Task {i}] load best checkpoint for test: {best_model_path}")
+        model.load_state_dict(load_state_dict(best_model_path, location='cuda'), strict=False)
 
         # test is used to process gradient projection
         trainer.test(model, dataloaders=gpm_dataloader)
 
-
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(description="CDAD")
 
     parser.add_argument("--resume_path", default='./models/base.ckpt')

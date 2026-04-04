@@ -48,11 +48,18 @@ model:
     log_every_t: 200
     log_name: encoder_decoder_4-23_woTimemb
     lora_alpha: 1.0
-    lora_rank: 4
+    lora_rank: 16
+    init_experts: 1
+    adaptive_init_on_task0: true
+    max_experts_per_layer: 8
+    max_new_experts_per_task: 8
+#    change the num of the workers with your setting change
+    novelty_step: 0.1
     monitor: val/loss_simple_ema
     novelty_threshold: 0.2
     num_timesteps_cond: 1
     orth_lambda: 0.0001
+    orth_constraint_mode: "soft"
     scale_factor: 0.18215
     timesteps: 1000
     unet_config:

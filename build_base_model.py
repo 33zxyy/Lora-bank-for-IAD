@@ -6,7 +6,7 @@ sys.path.append(os.getcwd())
 model_path = './v1-5-pruned.ckpt'
 
 # Output DiAD model
-output_path = './models/base.ckpt'
+output_path = 'models/base.ckpt'
 
 # autoencoders
 vae_path = './model.ckpt'

@@ -28,12 +28,14 @@ class AdditiveLoRAAdapter(nn.Module):
         self.out_dim = out_dim
 
     def add_expert(self, trainable: bool = True):
+        # Lightning test/inference loops may run under torch.inference_mode().
+        # Ensure newly appended trainable parameters are normal tensors.
         with torch.inference_mode(False):
-            a=nn.Parameter(torch.zeros(self.rank,self.in_dim))
-            b=nn.Parameter(torch.zeros(self.out_dim,self.rank))
-            nn.init.kaiming_uniform_(a,a=5 ** 0.5)
+            a = nn.Parameter(torch.zeros(self.rank, self.in_dim))
+            b = nn.Parameter(torch.zeros(self.out_dim, self.rank))
+            nn.init.kaiming_uniform_(a, a=5 ** 0.5)
             nn.init.zeros_(b)
-            gate=nn.Parameter(torch.tensor(1.0))
+            gate = nn.Parameter(torch.tensor(1.0))
         a.requires_grad = trainable
         b.requires_grad = trainable
         gate.requires_grad = trainable
