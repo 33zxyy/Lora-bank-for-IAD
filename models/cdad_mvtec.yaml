@@ -52,7 +52,7 @@ model:
     init_experts: 1
     adaptive_init_on_task0: true
     max_experts_per_layer: 8
-    max_new_experts_per_task: 8
+    max_new_experts_per_task: 2
     router_topk: 2
     warmup_novelty_batches: 4
 #    change the num of the workers with your setting change
@@ -61,7 +61,7 @@ model:
     novelty_threshold: 0.2
     num_timesteps_cond: 1
     orth_lambda: 0.0001
-    orth_constraint_mode: "soft"
+    orth_constraint_mode: "hard"
     scale_factor: 0.18215
     timesteps: 1000
     unet_config:

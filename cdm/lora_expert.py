@@ -144,8 +144,55 @@ class AdditiveLoRAAdapter(nn.Module):
         topv, topi = torch.topk(logits, k=topk, dim=-1)
         coeff_sparse = torch.zeros_like(logits)
         coeff_sparse.scatter_(-1, topi, torch.softmax(topv, dim=-1))
-        # Weight-space merge is shared across the mini-batch; average sample-wise routing.
-        return coeff_sparse.mean(dim=0)
+        return coeff_sparse
+
+    def _delta_output(self, x, routing_coeff, out_shape=None):
+        if self.num_experts == 0 or routing_coeff is None:
+            if out_shape is None:
+                return None
+            return torch.zeros(out_shape, device=x.device, dtype=x.dtype)
+
+        if isinstance(self.module, nn.Linear):
+            x_flat = x.reshape(-1, x.shape[-1])
+            delta_flat = torch.zeros(
+                x_flat.shape[0], self.out_dim, device=x.device, dtype=x.dtype
+            )
+            for i in range(self.num_experts):
+                coeff = routing_coeff[:, i:i + 1]
+                if torch.count_nonzero(coeff).item() == 0:
+                    continue
+                a, b = self._get_ab(i)
+                if self.orth_mode == "hard":
+                    a = self._project_to_old_subspace_complement(a, i)
+                d = (x_flat @ a.t()) @ b.t()
+                delta_flat = delta_flat + coeff * d
+            return self.alpha * delta_flat.view(*x.shape[:-1], self.out_dim)
+
+        bsz = x.shape[0]
+        x_unfold = F.unfold(
+            x,
+            kernel_size=self.module.kernel_size,
+            dilation=self.module.dilation,
+            padding=self.module.padding,
+            stride=self.module.stride
+        ).transpose(1, 2)
+        delta_tokens = torch.zeros(
+            bsz, x_unfold.shape[1], self.out_dim, device=x.device, dtype=x.dtype
+        )
+        for i in range(self.num_experts):
+            coeff = routing_coeff[:, i].view(bsz, 1, 1)
+            if torch.count_nonzero(coeff).item() == 0:
+                continue
+            a, b = self._get_ab(i)
+            if self.orth_mode == "hard":
+                a = self._project_to_old_subspace_complement(a, i)
+            d = (x_unfold @ a.t()) @ b.t()
+            delta_tokens = delta_tokens + coeff * d
+
+        if out_shape is None:
+            raise ValueError("out_shape must be provided for Conv2d delta reconstruction.")
+        h_out, w_out = out_shape[-2], out_shape[-1]
+        return self.alpha * delta_tokens.transpose(1, 2).reshape(bsz, self.out_dim, h_out, w_out)
 
     def merged_delta(self, routing_coeff=None):
         if self.num_experts == 0:
@@ -173,18 +220,9 @@ class AdditiveLoRAAdapter(nn.Module):
 
     def forward(self, x):
         routing_coeff = self._routing_coeff(x)
-        w_eff = self.module.weight + self.merged_delta(routing_coeff=routing_coeff)
-        if isinstance(self.module, nn.Linear):
-            return F.linear(x, w_eff, self.module.bias)
-        return F.conv2d(
-            x,
-            w_eff,
-            self.module.bias,
-            stride=self.module.stride,
-            padding=self.module.padding,
-            dilation=self.module.dilation,
-            groups=self.module.groups,
-        )
+        base = self.module(x)
+        delta = self._delta_output(x, routing_coeff, out_shape=base.shape)
+        return base + delta
 
     @torch.no_grad()
     def fuse_into_weight(self):
