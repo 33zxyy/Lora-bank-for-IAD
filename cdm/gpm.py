@@ -77,6 +77,8 @@ class CDAD(SD_AMN):
                 adapter.freeze_expert(adapter.num_experts - 1)
             for _ in range(num_new_experts):
                 adapter.add_expert(trainable=trainable)
+                if self.orth_constraint_mode == "hard":
+                    self._project_latest_expert_to_orthogonal_complement(adapter)
 
     def _assert_control_branch_without_lora(self):
         for module in self.control_model.modules():
@@ -114,24 +116,23 @@ class CDAD(SD_AMN):
         return max(num_new_experts, 0)
 
     @torch.no_grad()
-    def _apply_hard_orthogonal_constraint(self):
-        for adapter in self.layer_adapters.values():
-            if adapter.num_experts <= 1:
-                continue
-            latest_idx = adapter.num_experts - 1
-            a_latest = adapter.get_a(latest_idx)
-            u_prev = adapter.orth_basis(upto=latest_idx)
-            if u_prev is None or u_prev.numel() == 0:
-                continue
-            # Hard-constraint: explicitly remove the component in the previous
-            # expert subspace so the newest expert focuses on novel directions.
-            proj = (a_latest @ u_prev.t()) @ u_prev
-            residual = a_latest - proj
-            old_norm = torch.norm(a_latest, p='fro')
-            new_norm = torch.norm(residual, p='fro')
-            if new_norm > 1e-12:
-                residual = residual * (old_norm / new_norm)
-            a_latest.data.copy_(residual)
+    def _project_latest_expert_to_orthogonal_complement(self, adapter):
+        if adapter.num_experts <= 1:
+            return
+        latest_idx = adapter.num_experts - 1
+        a_latest = adapter.get_a(latest_idx)
+        u_prev = adapter.orth_basis(upto=latest_idx)
+        if u_prev is None or u_prev.numel() == 0:
+            return
+        # Hard subspace parameterization:
+        #   P = I - U^T U,  A_new = A_tilde @ P
+        proj = (a_latest @ u_prev.t()) @ u_prev
+        residual = a_latest - proj
+        old_norm = torch.norm(a_latest, p='fro')
+        new_norm = torch.norm(residual, p='fro')
+        if new_norm > 1e-12:
+            residual = residual * (old_norm / new_norm)
+        a_latest.data.copy_(residual)
 
     def configure_optimizers(self):
         lr = self.learning_rate
@@ -199,8 +200,6 @@ class CDAD(SD_AMN):
         opt.zero_grad()
         self.manual_backward(total_loss)
         opt.step()
-        if self.orth_constraint_mode == "hard":
-            self._apply_hard_orthogonal_constraint()
 
     def get_activation(self, name):
         def hook(model, input, output):
