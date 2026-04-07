@@ -56,7 +56,8 @@ class CDAD(SD_AMN):
             self._append_new_expert(trainable=True, num_new_experts=init_num_experts, freeze_previous=False)
 
     def _attach_lora_adapters(self):
-        target_names = set(self.unet_train_param_name + self.control_train_param_name)
+        # Keep LoRA on diffusion UNet only; AMN/control branch runs without LoRA.
+        target_names = set(self.unet_train_param_name)
         for name, module in self.model.diffusion_model.named_modules():
             if name in target_names and isinstance(module, (nn.Linear, nn.Conv2d)):
                 parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
@@ -66,15 +67,6 @@ class CDAD(SD_AMN):
                 adapter = AdditiveLoRAAdapter(module, rank=self.lora_rank, alpha=self.lora_alpha)
                 setattr(parent, attr_name, adapter)
                 self.layer_adapters[f"diffusion::{name}"] = adapter
-
-        for name, module in self.control_model.named_modules():
-            if name in target_names and isinstance(module, (nn.Linear, nn.Conv2d)):
-                parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
-                attr_name = name.split('.')[-1]
-                parent = self.control_model.get_submodule(parent_name) if parent_name else self.control_model
-                adapter = AdditiveLoRAAdapter(module, rank=self.lora_rank, alpha=self.lora_alpha)
-                setattr(parent, attr_name, adapter)
-                self.layer_adapters[f"control::{name}"] = adapter
 
     def _append_new_expert(self, trainable=True, num_new_experts=1, freeze_previous=True):
         if num_new_experts <= 0:
