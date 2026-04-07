@@ -26,6 +26,8 @@ class AdditiveLoRAAdapter(nn.Module):
 
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.orth_mode = "soft"
+        self.router_topk = 2
 
     def add_expert(self, trainable: bool = True):
         # Lightning test/inference loops may run under torch.inference_mode().
@@ -93,6 +95,15 @@ class AdditiveLoRAAdapter(nn.Module):
                 loss = loss + torch.norm(q_list[i] @ q_list[j].t(), p='fro') ** 2
         return loss
 
+    def _project_to_old_subspace_complement(self, a, idx):
+        if idx <= 0:
+            return a
+        u_prev = self.orth_basis(upto=idx)
+        if u_prev is None or u_prev.numel() == 0:
+            return a
+        # A_eff = A_tilde (I - U^T U) = A_tilde - (A_tilde U^T) U
+        return a - (a @ u_prev.t()) @ u_prev
+
     def novelty_energy(self, idx):
         if idx == 0:
             return 1.0
@@ -110,10 +121,17 @@ class AdditiveLoRAAdapter(nn.Module):
         if self.num_experts == 0:
             return torch.zeros_like(self.module.weight)
         delta = torch.zeros_like(self.module.weight)
-        for i in range(self.num_experts):
+        gate_values = torch.stack([g for g in self.expert_gates], dim=0)
+        topk = self.num_experts if self.router_topk is None else max(int(self.router_topk), 1)
+        topk = min(topk, self.num_experts)
+        selected = torch.topk(gate_values, k=topk, dim=0).indices.tolist()
+        selected_gates = torch.softmax(gate_values[selected], dim=0)
+        for coeff, i in zip(selected_gates, selected):
             a, b = self._get_ab(i)
+            if self.orth_mode == "hard":
+                a = self._project_to_old_subspace_complement(a, i)
             d = (b @ a).view_as(self.module.weight)
-            delta = delta + self.expert_gates[i] * d
+            delta = delta + coeff * d
         return self.alpha * delta
 
     def forward(self, x):

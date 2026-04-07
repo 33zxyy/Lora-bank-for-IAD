@@ -28,7 +28,7 @@ class CDAD(SD_AMN):
 
     def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
                  init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
-                 orth_constraint_mode="soft", adaptive_init_on_task0=False,
+                 orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -42,6 +42,7 @@ class CDAD(SD_AMN):
             self.max_new_experts_per_task = max_new_experts_per_task
             self.novelty_step = novelty_step
             self.adaptive_init_on_task0 = adaptive_init_on_task0
+            self.router_topk = router_topk
             if orth_constraint_mode not in ("soft", "hard"):
                 raise ValueError(f"orth_constraint_mode must be 'soft' or 'hard', got {orth_constraint_mode}")
             self.orth_constraint_mode = orth_constraint_mode
@@ -66,6 +67,8 @@ class CDAD(SD_AMN):
                 parent = self.model.diffusion_model.get_submodule(
                     parent_name) if parent_name else self.model.diffusion_model
                 adapter = AdditiveLoRAAdapter(module, rank=self.lora_rank, alpha=self.lora_alpha)
+                adapter.orth_mode = self.orth_constraint_mode
+                adapter.router_topk = self.router_topk
                 setattr(parent, attr_name, adapter)
                 self.layer_adapters[f"diffusion::{name}"] = adapter
 
@@ -74,11 +77,10 @@ class CDAD(SD_AMN):
             return
         for adapter in self.layer_adapters.values():
             if freeze_previous and adapter.num_experts > 0:
-                adapter.freeze_expert(adapter.num_experts - 1)
+                for i in range(adapter.num_experts):
+                    adapter.freeze_expert(i)
             for _ in range(num_new_experts):
                 adapter.add_expert(trainable=trainable)
-                if self.orth_constraint_mode == "hard":
-                    self._project_latest_expert_to_orthogonal_complement(adapter)
 
     def _assert_control_branch_without_lora(self):
         for module in self.control_model.modules():
@@ -95,10 +97,25 @@ class CDAD(SD_AMN):
 
     def _novelty_energy(self):
         energies = []
-        for adapter in self.layer_adapters.values():
+        for key, adapter in self.layer_adapters.items():
             if adapter.num_experts == 0:
                 continue
-            energies.append(adapter.novelty_energy(adapter.num_experts - 1))
+            layer_name = key.split("::", 1)[-1]
+            if layer_name not in self.act:
+                continue
+            feat = self.act[layer_name].to(device=self.device)
+            if feat.numel() == 0:
+                continue
+            u_old = adapter.orth_basis(upto=adapter.num_experts)
+            if u_old is None or u_old.numel() == 0:
+                energies.append(1.0)
+                continue
+            u_old = u_old.to(device=self.device)
+            proj = u_old.t() @ (u_old @ feat)
+            residual = feat - proj
+            den = torch.norm(feat, p='fro') ** 2 + 1e-8
+            num = torch.norm(residual, p='fro') ** 2
+            energies.append(float((num / den).item()))
         if len(energies) == 0:
             return 0.0
         return float(sum(energies) / len(energies))
@@ -114,25 +131,6 @@ class CDAD(SD_AMN):
             room = max(self.max_experts_per_layer - current_experts, 0)
             num_new_experts = min(num_new_experts, room)
         return max(num_new_experts, 0)
-
-    @torch.no_grad()
-    def _project_latest_expert_to_orthogonal_complement(self, adapter):
-        if adapter.num_experts <= 1:
-            return
-        latest_idx = adapter.num_experts - 1
-        a_latest = adapter.get_a(latest_idx)
-        u_prev = adapter.orth_basis(upto=latest_idx)
-        if u_prev is None or u_prev.numel() == 0:
-            return
-        # Hard subspace parameterization:
-        #   P = I - U^T U,  A_new = A_tilde @ P
-        proj = (a_latest @ u_prev.t()) @ u_prev
-        residual = a_latest - proj
-        old_norm = torch.norm(a_latest, p='fro')
-        new_norm = torch.norm(residual, p='fro')
-        if new_norm > 1e-12:
-            residual = residual * (old_norm / new_norm)
-        a_latest.data.copy_(residual)
 
     def configure_optimizers(self):
         lr = self.learning_rate

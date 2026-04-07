@@ -53,6 +53,7 @@ model:
     adaptive_init_on_task0: true
     max_experts_per_layer: 8
     max_new_experts_per_task: 2
+    router_topk: 2
     novelty_step: 0.1
     monitor: val/loss_simple_ema
     novelty_threshold: 0.2
