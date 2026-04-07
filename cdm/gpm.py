@@ -47,6 +47,7 @@ class CDAD(SD_AMN):
             self.orth_constraint_mode = orth_constraint_mode
             self.layer_adapters = {}
             self._attach_lora_adapters()
+            self._assert_control_branch_without_lora()
             init_num_experts = self.init_experts
             if self.adaptive_init_on_task0:
                 # Before task0 we do not have previous task statistics yet.
@@ -56,7 +57,8 @@ class CDAD(SD_AMN):
             self._append_new_expert(trainable=True, num_new_experts=init_num_experts, freeze_previous=False)
 
     def _attach_lora_adapters(self):
-        target_names = set(self.unet_train_param_name + self.control_train_param_name)
+        # Keep LoRA on diffusion UNet only; AMN/control branch runs without LoRA.
+        target_names = set(self.unet_train_param_name)
         for name, module in self.model.diffusion_model.named_modules():
             if name in target_names and isinstance(module, (nn.Linear, nn.Conv2d)):
                 parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
@@ -67,15 +69,6 @@ class CDAD(SD_AMN):
                 setattr(parent, attr_name, adapter)
                 self.layer_adapters[f"diffusion::{name}"] = adapter
 
-        for name, module in self.control_model.named_modules():
-            if name in target_names and isinstance(module, (nn.Linear, nn.Conv2d)):
-                parent_name = name.rsplit('.', 1)[0] if '.' in name else ''
-                attr_name = name.split('.')[-1]
-                parent = self.control_model.get_submodule(parent_name) if parent_name else self.control_model
-                adapter = AdditiveLoRAAdapter(module, rank=self.lora_rank, alpha=self.lora_alpha)
-                setattr(parent, attr_name, adapter)
-                self.layer_adapters[f"control::{name}"] = adapter
-
     def _append_new_expert(self, trainable=True, num_new_experts=1, freeze_previous=True):
         if num_new_experts <= 0:
             return
@@ -84,6 +77,13 @@ class CDAD(SD_AMN):
                 adapter.freeze_expert(adapter.num_experts - 1)
             for _ in range(num_new_experts):
                 adapter.add_expert(trainable=trainable)
+                if self.orth_constraint_mode == "hard":
+                    self._project_latest_expert_to_orthogonal_complement(adapter)
+
+    def _assert_control_branch_without_lora(self):
+        for module in self.control_model.modules():
+            if isinstance(module, AdditiveLoRAAdapter):
+                raise RuntimeError("AMN/control branch contains LoRA adapters, but it should remain LoRA-free.")
 
     def _orthogonal_regularization(self):
         if not self.layer_adapters:
@@ -116,48 +116,48 @@ class CDAD(SD_AMN):
         return max(num_new_experts, 0)
 
     @torch.no_grad()
-    def _apply_hard_orthogonal_constraint(self):
-        for adapter in self.layer_adapters.values():
-            if adapter.num_experts <= 1:
-                continue
-            latest_idx = adapter.num_experts - 1
-            a_latest = adapter.get_a(latest_idx)
-            u_prev = adapter.orth_basis(upto=latest_idx)
-            if u_prev is None or u_prev.numel() == 0:
-                continue
-            # Hard-constraint: explicitly remove the component in the previous
-            # expert subspace so the newest expert focuses on novel directions.
-            proj = (a_latest @ u_prev.t()) @ u_prev
-            residual = a_latest - proj
-            old_norm = torch.norm(a_latest, p='fro')
-            new_norm = torch.norm(residual, p='fro')
-            if new_norm > 1e-12:
-                residual = residual * (old_norm / new_norm)
-            a_latest.data.copy_(residual)
+    def _project_latest_expert_to_orthogonal_complement(self, adapter):
+        if adapter.num_experts <= 1:
+            return
+        latest_idx = adapter.num_experts - 1
+        a_latest = adapter.get_a(latest_idx)
+        u_prev = adapter.orth_basis(upto=latest_idx)
+        if u_prev is None or u_prev.numel() == 0:
+            return
+        # Hard subspace parameterization:
+        #   P = I - U^T U,  A_new = A_tilde @ P
+        proj = (a_latest @ u_prev.t()) @ u_prev
+        residual = a_latest - proj
+        old_norm = torch.norm(a_latest, p='fro')
+        new_norm = torch.norm(residual, p='fro')
+        if new_norm > 1e-12:
+            residual = residual * (old_norm / new_norm)
+        a_latest.data.copy_(residual)
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        trainable = []
+        lora_trainable = []
         for adapter in self.layer_adapters.values():
             for i in range(adapter.num_experts):
                 a, b = adapter._get_ab(i)
                 g = adapter.expert_gates[i]
                 if a.requires_grad:
-                    trainable.extend([a, b, g])
+                    lora_trainable.extend([a, b, g])
 
-        for p in self.control_model.parameters():
-            p.requires_grad = False
+        control_trainable = list(self.control_model.parameters())
+        for p in control_trainable:
+            p.requires_grad = True
 
         for p in self.model.diffusion_model.parameters():
             p.requires_grad = False
 
-        for p in trainable:
+        for p in lora_trainable:
             p.requires_grad = True
 
+        trainable = control_trainable + lora_trainable
         if len(trainable) == 0:
             raise RuntimeError(
-                "No trainable LoRA parameters were found. "
-                "Please check whether LoRA adapters were attached to any target layers."
+                "No trainable parameters were found for control branch or LoRA adapters."
             )
 
         opt = torch.optim.AdamW(trainable, lr=lr)
@@ -200,8 +200,6 @@ class CDAD(SD_AMN):
         opt.zero_grad()
         self.manual_backward(total_loss)
         opt.step()
-        if self.orth_constraint_mode == "hard":
-            self._apply_hard_orthogonal_constraint()
 
     def get_activation(self, name):
         def hook(model, input, output):

@@ -1,9 +1,9 @@
 import sys
 import os
+
 sys.path.append(os.getcwd())
 from share import *
 from utils.util import *
-import torch
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from data.visa_dataloader import VisADataset_cad
@@ -19,8 +19,25 @@ def main(args):
 
     model = create_model('models/cdad_visa.yaml').cpu()
 
-    weights = torch.load(args.resume_path)
-    model.load_state_dict(weights, strict=False)
+    weights = load_state_dict(args.resume_path, location='cpu')
+    model_state = model.state_dict()
+    compatible_weights = {}
+    skipped_mismatch = []
+    for key, value in weights.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_mismatch.append(key)
+            continue
+        compatible_weights[key] = value
+
+    if skipped_mismatch:
+        print(
+            f"[load_state_dict] Skipped {len(skipped_mismatch)} mismatched tensors "
+            f"(e.g. LoRA rank changed)."
+        )
+
+    model.load_state_dict(compatible_weights, strict=False)
 
     model.learning_rate = args.learning_rate
 
@@ -28,7 +45,6 @@ def main(args):
     test_dataset, _ = VisADataset_cad('test', args.data_path, args.setting)
 
     for i in range(task_num):
-
         model.set_log_name(log_name + f'/task{i}')
 
         ckpt_callback_val = ModelCheckpoint(
@@ -38,28 +54,28 @@ def main(args):
             mode='max')
 
         trainer = pl.Trainer(gpus=1, precision=32,
-                            callbacks=[ckpt_callback_val, ],
-                            num_sanity_val_steps=0,
-                            accumulate_grad_batches=1,     # Do not change!!!
-                            max_epochs=args.max_epoch,
-                            check_val_every_n_epoch=args.check_v,
-                            enable_progress_bar=False
-                            )
-
+                             callbacks=[ckpt_callback_val, ],
+                             num_sanity_val_steps=0,
+                             accumulate_grad_batches=1,  # Do not change!!!
+                             max_epochs=args.max_epoch,
+                             check_val_every_n_epoch=args.check_v,
+                             enable_progress_bar=False
+                             )
 
         train_dataloader = DataLoader(train_dataset[i], num_workers=8, batch_size=args.batch_size, shuffle=True)
         gpm_dataloader = DataLoader(train_dataset[i], num_workers=8, batch_size=args.gpm_batch_size, shuffle=False)
         test_dataloader = DataLoader(test_dataset[i], num_workers=8, batch_size=args.batch_size, shuffle=False)
 
         trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=test_dataloader)
-        
-        model.load_state_dict(load_state_dict(trainer.checkpoint_callback.best_model_path, location='cuda'), strict=False)
+
+        model.load_state_dict(load_state_dict(trainer.checkpoint_callback.best_model_path, location='cuda'),
+                              strict=False)
 
         # test is used to process gradient projection
         trainer.test(model, dataloaders=gpm_dataloader)
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CDAD")
 
     parser.add_argument("--resume_path", default='./models/base.ckpt')
@@ -83,8 +99,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
-
-
-
-
