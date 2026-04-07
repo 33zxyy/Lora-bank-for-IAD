@@ -29,6 +29,7 @@ class CDAD(SD_AMN):
     def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
                  init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
                  orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
+                 warmup_novelty_batches=4,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -43,6 +44,10 @@ class CDAD(SD_AMN):
             self.novelty_step = novelty_step
             self.adaptive_init_on_task0 = adaptive_init_on_task0
             self.router_topk = router_topk
+            self.warmup_novelty_batches = warmup_novelty_batches
+            self._warmup_batch_count = 0
+            self._warmup_done = False
+            self._warmup_hook_handle = {}
             if orth_constraint_mode not in ("soft", "hard"):
                 raise ValueError(f"orth_constraint_mode must be 'soft' or 'hard', got {orth_constraint_mode}")
             self.orth_constraint_mode = orth_constraint_mode
@@ -91,6 +96,35 @@ class CDAD(SD_AMN):
         for module in self.control_model.modules():
             if isinstance(module, AdditiveLoRAAdapter):
                 raise RuntimeError("AMN/control branch contains LoRA adapters, but it should remain LoRA-free.")
+
+    def _start_task_warmup(self):
+        self._warmup_batch_count = 0
+        self._warmup_done = (self.warmup_novelty_batches is None or self.warmup_novelty_batches <= 0)
+        self._warmup_hook_handle = {}
+        if self._warmup_done:
+            return
+        self.act = {}
+        for name, module in self.model.diffusion_model.named_modules():
+            if name in self.unet_train_param_name:
+                self._warmup_hook_handle[name] = module.register_forward_hook(self.get_activation(name))
+
+    def _finish_task_warmup_and_grow(self):
+        novelty = self._novelty_energy()
+        current = 0
+        if len(self.layer_adapters) > 0:
+            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
+        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current)
+        if num_new_experts > 0:
+            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
+        for value in self._warmup_hook_handle.values():
+            value.remove()
+        self._warmup_hook_handle = {}
+        self.act = {}
+        self._warmup_done = True
+        self.logger_val.info(
+            f"[WarmupGrow] novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
+            f"new_experts={num_new_experts}, warmup_batches={self.warmup_batch_count}"
+        )
 
     def _orthogonal_regularization(self):
         if not self.layer_adapters:
@@ -203,6 +237,13 @@ class CDAD(SD_AMN):
         opt.zero_grad()
         self.manual_backward(total_loss)
         opt.step()
+        if not self._warmup_done:
+            self._warmup_batch_count += 1
+            if self._warmup_batch_count >= self.warmup_novelty_batches:
+                self._finish_task_warmup_and_grow()
+
+    def on_train_start(self):
+        self._start_task_warmup()
 
     def get_activation(self, name):
         def hook(model, input, output):
