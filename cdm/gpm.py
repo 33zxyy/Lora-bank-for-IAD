@@ -135,27 +135,28 @@ class CDAD(SD_AMN):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        trainable = []
+        lora_trainable = []
         for adapter in self.layer_adapters.values():
             for i in range(adapter.num_experts):
                 a, b = adapter._get_ab(i)
                 g = adapter.expert_gates[i]
                 if a.requires_grad:
-                    trainable.extend([a, b, g])
+                    lora_trainable.extend([a, b, g])
 
-        for p in self.control_model.parameters():
-            p.requires_grad = False
+        control_trainable = list(self.control_model.parameters())
+        for p in control_trainable:
+            p.requires_grad = True
 
         for p in self.model.diffusion_model.parameters():
             p.requires_grad = False
 
-        for p in trainable:
+        for p in lora_trainable:
             p.requires_grad = True
 
+        trainable = control_trainable + lora_trainable
         if len(trainable) == 0:
             raise RuntimeError(
-                "No trainable LoRA parameters were found. "
-                "Please check whether LoRA adapters were attached to any target layers."
+                "No trainable parameters were found for control branch or LoRA adapters."
             )
 
         opt = torch.optim.AdamW(trainable, lr=lr)
