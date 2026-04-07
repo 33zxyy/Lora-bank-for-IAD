@@ -64,6 +64,8 @@ class AMN(nn.Module):
             normalize_before=False,
     ):
         super().__init__()
+        # Explicit marker: AMN/control branch should stay LoRA-free.
+        self.disable_lora = True
 
         self.model_channels = model_channels
 
@@ -162,4 +164,3 @@ class AMN(nn.Module):
             return feature_rec
         else:
             return hint_feature
-

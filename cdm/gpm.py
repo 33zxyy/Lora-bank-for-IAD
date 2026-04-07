@@ -47,6 +47,7 @@ class CDAD(SD_AMN):
             self.orth_constraint_mode = orth_constraint_mode
             self.layer_adapters = {}
             self._attach_lora_adapters()
+            self._assert_control_branch_without_lora()
             init_num_experts = self.init_experts
             if self.adaptive_init_on_task0:
                 # Before task0 we do not have previous task statistics yet.
@@ -76,6 +77,11 @@ class CDAD(SD_AMN):
                 adapter.freeze_expert(adapter.num_experts - 1)
             for _ in range(num_new_experts):
                 adapter.add_expert(trainable=trainable)
+
+    def _assert_control_branch_without_lora(self):
+        for module in self.control_model.modules():
+            if isinstance(module, AdditiveLoRAAdapter):
+                raise RuntimeError("AMN/control branch contains LoRA adapters, but it should remain LoRA-free.")
 
     def _orthogonal_regularization(self):
         if not self.layer_adapters:
