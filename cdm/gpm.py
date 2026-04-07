@@ -66,7 +66,12 @@ class CDAD(SD_AMN):
                 attr_name = name.split('.')[-1]
                 parent = self.model.diffusion_model.get_submodule(
                     parent_name) if parent_name else self.model.diffusion_model
-                adapter = AdditiveLoRAAdapter(module, rank=self.lora_rank, alpha=self.lora_alpha)
+                adapter = AdditiveLoRAAdapter(
+                    module,
+                    rank=self.lora_rank,
+                    alpha=self.lora_alpha,
+                    max_experts=max(self.max_experts_per_layer or 0, 32)
+                )
                 adapter.orth_mode = self.orth_constraint_mode
                 adapter.router_topk = self.router_topk
                 setattr(parent, attr_name, adapter)
