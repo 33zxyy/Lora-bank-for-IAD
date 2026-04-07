@@ -201,33 +201,30 @@ class CDAD(SD_AMN):
 
     def get_activation(self, name):
         def hook(model, input, output):
-            if (isinstance(model, nn.Linear)
-                    or isinstance(model, nn.modules.linear.NonDynamicallyQuantizableLinear)
-                    or isinstance(model, MultiheadAttention)):
+            base = model.module if isinstance(model, AdditiveLoRAAdapter) else model
+            x = input[0].detach()
+            if (isinstance(base, nn.Linear)
+                    or isinstance(base, nn.modules.linear.NonDynamicallyQuantizableLinear)
+                    or isinstance(base, MultiheadAttention)):
 
-                input_channel = input[0].shape[-1]
+                input_channel = x.shape[-1]
+                mat = x.reshape(-1, input_channel).t().cpu()
 
-                mat = input[0].reshape(-1, input_channel).t().cpu()
+            elif isinstance(base, nn.Conv2d):
+                input_channel = x.shape[1]
+                padding = base.padding[0]
+                kernel_size = base.kernel_size[0]
+                stride = base.stride[0]
 
-                if name in self.act.keys():
-                    self.act[name] = torch.cat([self.act[name], mat], dim=1)
-                else:
-                    self.act[name] = mat
+                mat = F.unfold(x, kernel_size=kernel_size, stride=stride, padding=padding).transpose(0, 1).reshape(
+                    kernel_size * kernel_size * input_channel, -1).cpu()
+            else:
+                return
 
-            elif isinstance(model, nn.Conv2d):
-                batch_size, input_channel, input_map_size, _ = input[0].shape
-                padding = model.padding[0]
-                kernel_size = model.kernel_size[0]
-                stride = model.stride[0]
-
-                mat = F.unfold(input[0], kernel_size=kernel_size, stride=stride, padding=padding).transpose(0,
-                                                                                                            1).reshape(
-                    kernel_size * kernel_size * input_channel, -1).detach().cpu()
-
-                if name in self.act.keys():
-                    self.act[name] = torch.cat([self.act[name], mat], dim=1)
-                else:
-                    self.act[name] = mat
+            if name in self.act.keys():
+                self.act[name] = torch.cat([self.act[name], mat], dim=1)
+            else:
+                self.act[name] = mat
 
         return hook
 
