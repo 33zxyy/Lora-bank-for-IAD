@@ -9,9 +9,9 @@ model:
     control_key: hint
     distance: 'eucl'
     layers:
-      - 0
+      - 1
       - 2
-      - 4
+      - 3
     control_stage_config:
       params:
         hint_channels: 3
@@ -48,11 +48,13 @@ model:
     log_every_t: 200
     log_name: encoder_decoder_4-23_woTimemb
     lora_alpha: 1.0
-    lora_rank: 4
+    lora_rank: 16
     init_experts: 1
     adaptive_init_on_task0: true
     max_experts_per_layer: 8
-    max_new_experts_per_task: 2
+    max_new_experts_per_task: 8
+    router_topk: 2
+#    change the num of the workers with your setting change
     novelty_step: 0.1
     monitor: val/loss_simple_ema
     novelty_threshold: 0.2
