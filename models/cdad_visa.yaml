@@ -9,9 +9,9 @@ model:
     control_key: hint
     distance: 'eucl'
     layers:
-      - 1
+      - 0
       - 2
-      - 3
+      - 4
     control_stage_config:
       params:
         hint_channels: 3
@@ -52,9 +52,9 @@ model:
     init_experts: 1
     adaptive_init_on_task0: true
     max_experts_per_layer: 8
-    max_new_experts_per_task: 8
+    max_new_experts_per_task: 2
     router_topk: 2
-#    change the num of the workers with your setting change
+    warmup_novelty_batches: 4
     novelty_step: 0.1
     monitor: val/loss_simple_ema
     novelty_threshold: 0.2

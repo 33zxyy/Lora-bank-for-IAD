@@ -6,7 +6,8 @@ import torch.nn.functional as F
 class AdditiveLoRAAdapter(nn.Module):
     """Additive LoRA expert library for Conv2d/Linear with no-routing weighted fusion."""
 
-    def __init__(self, module: nn.Module, rank: int = 4, alpha: float = 1.0):
+    def __init__(self, module: nn.Module, rank: int = 4, alpha: float = 1.0,
+                 max_experts: int = 32, router_hidden_dim: int = 64):
         super().__init__()
         if not isinstance(module, (nn.Linear, nn.Conv2d)):
             raise TypeError("AdditiveLoRAAdapter only supports nn.Linear and nn.Conv2d")
@@ -14,20 +15,28 @@ class AdditiveLoRAAdapter(nn.Module):
         self.module = module
         self.rank = rank
         self.alpha = alpha
+        self.max_experts = max_experts
         self.experts = nn.ParameterList()
         self.expert_gates = nn.ParameterList()
 
         if isinstance(module, nn.Linear):
             in_dim = module.in_features
             out_dim = module.out_features
+            router_in_dim = module.in_features
         else:
             in_dim = module.in_channels * module.kernel_size[0] * module.kernel_size[1]
             out_dim = module.out_channels
+            router_in_dim = module.in_channels
 
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.orth_mode = "soft"
         self.router_topk = 2
+        self.router = nn.Sequential(
+            nn.Linear(router_in_dim, router_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(router_hidden_dim, max_experts),
+        )
 
     def add_expert(self, trainable: bool = True):
         # Lightning test/inference loops may run under torch.inference_mode().
@@ -117,16 +126,44 @@ class AdditiveLoRAAdapter(nn.Module):
         num = torch.norm(res, p='fro') ** 2
         return (num / den).item()
 
-    def merged_delta(self):
+    def _routing_coeff(self, x):
+        if self.num_experts == 0:
+            return None
+        if isinstance(self.module, nn.Conv2d):
+            # x: [B, C, H, W] -> [B, C]
+            feat = x.mean(dim=(2, 3))
+        else:
+            # x: [B, ..., C] -> [B, C]
+            feat = x.reshape(-1, x.shape[-1])
+        feat = feat.detach()
+        logits = self.router(feat)[:, :self.num_experts]
+        gate_bias = torch.stack([g for g in self.expert_gates], dim=0).unsqueeze(0)
+        logits = logits + gate_bias
+        topk = self.num_experts if self.router_topk is None else max(int(self.router_topk), 1)
+        topk = min(topk, self.num_experts)
+        topv, topi = torch.topk(logits, k=topk, dim=-1)
+        coeff_sparse = torch.zeros_like(logits)
+        coeff_sparse.scatter_(-1, topi, torch.softmax(topv, dim=-1))
+        # Weight-space merge is shared across the mini-batch; average sample-wise routing.
+        return coeff_sparse.mean(dim=0)
+
+    def merged_delta(self, routing_coeff=None):
         if self.num_experts == 0:
             return torch.zeros_like(self.module.weight)
         delta = torch.zeros_like(self.module.weight)
-        gate_values = torch.stack([g for g in self.expert_gates], dim=0)
-        topk = self.num_experts if self.router_topk is None else max(int(self.router_topk), 1)
-        topk = min(topk, self.num_experts)
-        selected = torch.topk(gate_values, k=topk, dim=0).indices.tolist()
-        selected_gates = torch.softmax(gate_values[selected], dim=0)
-        for coeff, i in zip(selected_gates, selected):
+        if routing_coeff is None:
+            gate_values = torch.stack([g for g in self.expert_gates], dim=0)
+            topk = self.num_experts if self.router_topk is None else max(int(self.router_topk), 1)
+            topk = min(topk, self.num_experts)
+            selected = torch.topk(gate_values, k=topk, dim=0).indices.tolist()
+            coeffs = torch.softmax(gate_values[selected], dim=0)
+        else:
+            topk = self.num_experts if self.router_topk is None else max(int(self.router_topk), 1)
+            topk = min(topk, self.num_experts)
+            selected = torch.topk(routing_coeff, k=topk, dim=0).indices.tolist()
+            coeffs = routing_coeff[selected]
+            coeffs = coeffs / (coeffs.sum() + 1e-8)
+        for coeff, i in zip(coeffs, selected):
             a, b = self._get_ab(i)
             if self.orth_mode == "hard":
                 a = self._project_to_old_subspace_complement(a, i)
@@ -135,7 +172,8 @@ class AdditiveLoRAAdapter(nn.Module):
         return self.alpha * delta
 
     def forward(self, x):
-        w_eff = self.module.weight + self.merged_delta()
+        routing_coeff = self._routing_coeff(x)
+        w_eff = self.module.weight + self.merged_delta(routing_coeff=routing_coeff)
         if isinstance(self.module, nn.Linear):
             return F.linear(x, w_eff, self.module.bias)
         return F.conv2d(
