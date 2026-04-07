@@ -116,6 +116,7 @@ class CDAD(SD_AMN):
         num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current)
         if num_new_experts > 0:
             self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
+            self._register_new_trainable_params_to_optimizer()
         for value in self._warmup_hook_handle.values():
             value.remove()
         self._warmup_hook_handle = {}
@@ -123,8 +124,29 @@ class CDAD(SD_AMN):
         self._warmup_done = True
         self.logger_val.info(
             f"[WarmupGrow] novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
-            f"new_experts={num_new_experts}, warmup_batches={self.warmup_batch_count}"
+            f"new_experts={num_new_experts}, warmup_batches={self._warmup_batch_count}"
         )
+
+    def _register_new_trainable_params_to_optimizer(self):
+        if self.trainer is None:
+            return
+        opt = self.optimizers()
+        if opt is None:
+            return
+        existing = {id(p) for group in opt.param_groups for p in group['params']}
+        new_params = []
+        for adapter in self.layer_adapters.values():
+            for i in range(adapter.num_experts):
+                a, b = adapter._get_ab(i)
+                g = adapter.expert_gates[i]
+                for p in (a, b, g):
+                    if p.requires_grad and id(p) not in existing:
+                        new_params.append(p)
+            for p in adapter.router.parameters():
+                if p.requires_grad and id(p) not in existing:
+                    new_params.append(p)
+        if len(new_params) > 0:
+            opt.add_param_group({"params": new_params})
 
     def _orthogonal_regularization(self):
         if not self.layer_adapters:
@@ -175,6 +197,9 @@ class CDAD(SD_AMN):
         lr = self.learning_rate
         lora_trainable = []
         for adapter in self.layer_adapters.values():
+            for p in adapter.router.parameters():
+                if p.requires_grad:
+                    lora_trainable.append(p)
             for i in range(adapter.num_experts):
                 a, b = adapter._get_ab(i)
                 g = adapter.expert_gates[i]
