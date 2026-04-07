@@ -3,7 +3,6 @@ import os
 sys.path.append(os.getcwd())
 from share import *
 from utils.util import *
-import torch
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from data.visa_dataloader import VisADataset_cad
@@ -19,8 +18,25 @@ def main(args):
 
     model = create_model('models/cdad_visa.yaml').cpu()
 
-    weights = torch.load(args.resume_path)
-    model.load_state_dict(weights, strict=False)
+    weights = load_state_dict(args.resume_path, location='cpu')
+    model_state = model.state_dict()
+    compatible_weights = {}
+    skipped_mismatch = []
+    for key, value in weights.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_mismatch.append(key)
+            continue
+        compatible_weights[key] = value
+
+    if skipped_mismatch:
+        print(
+            f"[load_state_dict] Skipped {len(skipped_mismatch)} mismatched tensors "
+            f"(e.g. LoRA rank changed)."
+        )
+
+    model.load_state_dict(compatible_weights, strict=False)
 
     model.learning_rate = args.learning_rate
 
@@ -83,8 +99,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
-
 
 
 
