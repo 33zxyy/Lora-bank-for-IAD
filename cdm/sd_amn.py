@@ -161,7 +161,12 @@ class SD_AMN(LatentDiffusion):
     def on_validation_epoch_end(self, *args, **kwargs):
 
         # evl_metrics = {'auc': [{'name': 'max'}, {'name': 'pixel'}, {'name': 'pro'}, {'name': 'apsp'}]}
-        evl_metrics = {'auc': [{'name': 'max'}, {'name': 'pixel'}]}
+        evl_metrics = {
+            'auc': [
+                {'name': 'max', 'kwargs': {'topk_ratio': 0.01, 'smooth_kernel': 4}},
+                {'name': 'pixel'}
+            ]
+        }
         self.print("Gathering final results ...")
         fileinfos, preds, masks = merge_together(self.result)
 

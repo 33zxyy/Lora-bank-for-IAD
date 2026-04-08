@@ -136,16 +136,26 @@ class EvalImageStd(EvalImage):
 
 class EvalImageMax(EvalImage):
     @staticmethod
-    def encode_pred(preds):
+    def encode_pred(preds, topk_ratio=0.01, smooth_kernel=0):
         N, _, _ = preds.shape
-        preds = torch.tensor(preds[:, None, ...]).cuda()  # N x 1 x H x W
-        # patches_score, _ = torch.tensor(preds).reshape(N, -1).topk(dim=-1, k=9)  # N x (H x W)
-        # w = 1.0 - F.softmax(patches_score, dim=-1)[0].item()
-        # for i in range(0, 8):
-        #     preds = (F.avg_pool2d(preds, 8, stride=1))
-        preds = preds.cpu().numpy()  # N x 1 x H x W
-        return preds.reshape(N, -1).max(axis=1)  # (N, )
-        # return w * patches_score[0]
+        preds_t = torch.as_tensor(preds, dtype=torch.float32).unsqueeze(1)  # N x 1 x H x W
+
+        # Optional local smoothing to reduce single-pixel noise.
+        k = int(smooth_kernel) if smooth_kernel is not None else 0
+        if k > 1:
+            k = min(k, preds_t.shape[-1], preds_t.shape[-2])
+            preds_t = F.avg_pool2d(preds_t, kernel_size=k, stride=1)
+
+        flat = preds_t.reshape(preds_t.shape[0], -1)
+        total = flat.shape[1]
+        ratio = float(topk_ratio) if topk_ratio is not None else 0.01
+        ratio = min(max(ratio, 0.0), 1.0)
+        k_top = max(1, int(total * ratio))
+        k_top = min(k_top, total)
+
+        # Robust image-level score: mean of top-k anomaly responses.
+        topk_vals, _ = torch.topk(flat, k=k_top, dim=1)
+        return topk_vals.mean(dim=1).cpu().numpy()  # (N, )
 
 
 # class EvalImageMax(EvalImage):
