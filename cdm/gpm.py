@@ -30,6 +30,7 @@ class CDAD(SD_AMN):
                  init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
                  orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
                  warmup_novelty_batches=4, grow_topk_layers=None,
+                 router_kd_lambda=0.05, router_proto_per_layer=32,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -49,6 +50,11 @@ class CDAD(SD_AMN):
             self._warmup_batch_count = 0
             self._warmup_done = False
             self._warmup_hook_handle = {}
+            self._warmup_router_hook_handle = {}
+            self._router_feat_bank = {}
+            self.router_kd_lambda = router_kd_lambda
+            self.router_proto_per_layer = router_proto_per_layer
+            self.router_prototype_bank = {}
             if orth_constraint_mode not in ("soft", "hard"):
                 raise ValueError(f"orth_constraint_mode must be 'soft' or 'hard', got {orth_constraint_mode}")
             self.orth_constraint_mode = orth_constraint_mode
@@ -141,15 +147,19 @@ class CDAD(SD_AMN):
         self._warmup_batch_count = 0
         self._warmup_done = (self.warmup_novelty_batches is None or self.warmup_novelty_batches <= 0)
         self._warmup_hook_handle = {}
+        self._warmup_router_hook_handle = {}
+        self._router_feat_bank = {}
         if self._warmup_done:
             return
         self.act = {}
         for name, module in self.model.diffusion_model.named_modules():
             if name in self.unet_train_param_name:
                 self._warmup_hook_handle[name] = module.register_forward_hook(self.get_activation(name))
+                self._warmup_router_hook_handle[name] = module.register_forward_hook(self.get_router_feature(name))
 
     def _finish_task_warmup_and_grow(self):
         layer_novelties = self._layer_novelty_energy()
+        self._update_router_prototype_bank(layer_novelties)
         growth_plan = self._build_growth_plan(layer_novelties)
         if len(growth_plan) > 0:
             self._append_new_expert(
@@ -160,8 +170,12 @@ class CDAD(SD_AMN):
             self._register_new_trainable_params_to_optimizer()
         for value in self._warmup_hook_handle.values():
             value.remove()
+        for value in self._warmup_router_hook_handle.values():
+            value.remove()
         self._warmup_hook_handle = {}
+        self._warmup_router_hook_handle = {}
         self.act = {}
+        self._router_feat_bank = {}
         self._warmup_done = True
         novelty = self._novelty_energy(layer_novelties=layer_novelties)
         total_new = sum(growth_plan.values()) if len(growth_plan) > 0 else 0
@@ -198,6 +212,53 @@ class CDAD(SD_AMN):
             plan = sorted(plan, key=lambda x: x[1], reverse=True)[:k]
 
         return {key: num_new for key, _, num_new in plan}
+
+    def _update_router_prototype_bank(self, layer_novelties):
+        for key, adapter in self.layer_adapters.items():
+            layer_name = key.split("::", 1)[-1]
+            novelty = layer_novelties.get(layer_name, 0.0)
+            threshold = self._layer_growth_threshold(layer_name)
+            if novelty <= threshold:
+                continue
+            feats = self._router_feat_bank.get(layer_name)
+            if feats is None or feats.numel() == 0:
+                continue
+            proto_n = min(int(self.router_proto_per_layer), feats.shape[0])
+            if proto_n <= 0:
+                continue
+            sel = torch.randperm(feats.shape[0])[:proto_n]
+            proto_feat = feats[sel].to(device=self.device)
+            with torch.no_grad():
+                old_logits = adapter.router(proto_feat)[:, :adapter.num_experts]
+                old_probs = torch.softmax(old_logits, dim=-1)
+            self.router_prototype_bank[layer_name] = {
+                "feat": proto_feat.detach().cpu(),
+                "prob": old_probs.detach().cpu(),
+                "num_experts": int(adapter.num_experts)
+            }
+
+    def _router_stability_loss(self):
+        if len(self.router_prototype_bank) == 0:
+            return torch.tensor(0.0, device=self.device)
+        loss = torch.tensor(0.0, device=self.device)
+        count = 0
+        for key, adapter in self.layer_adapters.items():
+            layer_name = key.split("::", 1)[-1]
+            proto = self.router_prototype_bank.get(layer_name)
+            if proto is None:
+                continue
+            old_n = int(proto["num_experts"])
+            if old_n <= 0:
+                continue
+            feat = proto["feat"].to(device=self.device)
+            target_prob = proto["prob"].to(device=self.device)
+            new_logits = adapter.router(feat)[:, :old_n]
+            log_prob = torch.log_softmax(new_logits, dim=-1)
+            loss = loss + F.kl_div(log_prob, target_prob, reduction="batchmean")
+            count += 1
+        if count == 0:
+            return torch.tensor(0.0, device=self.device)
+        return loss / count
 
     def _register_new_trainable_params_to_optimizer(self):
         if self.trainer is None:
@@ -321,14 +382,16 @@ class CDAD(SD_AMN):
 
         loss, loss_dict = self.shared_step(batch)
         orth_loss = self._orthogonal_regularization()
+        router_kd_loss = self._router_stability_loss()
         if self.orth_constraint_mode == "soft":
-            total_loss = loss + self.orth_lambda * orth_loss
+            total_loss = loss + self.orth_lambda * orth_loss + self.router_kd_lambda * router_kd_loss
         else:
-            total_loss = loss
+            total_loss = loss + self.router_kd_lambda * router_kd_loss
 
         self.log_dict(loss_dict, prog_bar=True,
                       logger=True, on_step=True, on_epoch=True)
         self.log("orth_loss", orth_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log("router_kd_loss", router_kd_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log("global_step", self.global_step,
                  prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
@@ -375,6 +438,26 @@ class CDAD(SD_AMN):
             else:
                 self.act[name] = mat
 
+        return hook
+
+    def get_router_feature(self, name):
+        def hook(model, input, output):
+            if not isinstance(model, AdditiveLoRAAdapter):
+                return
+            x = input[0].detach()
+            if isinstance(model.module, nn.Conv2d):
+                feat = x.mean(dim=(2, 3))
+            else:
+                feat = x.reshape(-1, x.shape[-1])
+            feat = feat.to(device='cpu')
+            max_keep = max(int(self.router_proto_per_layer) * 8, int(self.router_proto_per_layer))
+            if name in self._router_feat_bank:
+                merged = torch.cat([self._router_feat_bank[name], feat], dim=0)
+                if merged.shape[0] > max_keep:
+                    merged = merged[-max_keep:]
+                self._router_feat_bank[name] = merged
+            else:
+                self._router_feat_bank[name] = feat[-max_keep:]
         return hook
 
     @torch.no_grad()

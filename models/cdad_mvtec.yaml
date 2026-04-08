@@ -56,6 +56,8 @@ model:
     router_topk: 2
     warmup_novelty_batches: 4
     grow_topk_layers: 6
+    router_kd_lambda: 0.05
+    router_proto_per_layer: 32
 #    change the num of the workers with your setting change
     novelty_step: 0.1
     monitor: val/loss_simple_ema
