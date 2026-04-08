@@ -29,7 +29,8 @@ class CDAD(SD_AMN):
     def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
                  init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
                  orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
-                 warmup_novelty_batches=4,
+                 warmup_novelty_batches=4, conv_sample_pool_stride=2,
+                 conv_sample_max_patches=512, warmup_max_cols_per_layer=2048,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -45,6 +46,9 @@ class CDAD(SD_AMN):
             self.adaptive_init_on_task0 = adaptive_init_on_task0
             self.router_topk = router_topk
             self.warmup_novelty_batches = warmup_novelty_batches
+            self.conv_sample_pool_stride = max(int(conv_sample_pool_stride), 1)
+            self.conv_sample_max_patches = max(int(conv_sample_max_patches), 1)
+            self.warmup_max_cols_per_layer = max(int(warmup_max_cols_per_layer), 1)
             self._warmup_batch_count = 0
             self._warmup_done = False
             self._warmup_hook_handle = {}
@@ -300,16 +304,18 @@ class CDAD(SD_AMN):
                     or isinstance(base, MultiheadAttention)):
 
                 input_channel = x.shape[-1]
-                mat = x.reshape(-1, input_channel).t().cpu()
+                mat = x.reshape(-1, input_channel).t()
 
             elif isinstance(base, nn.Conv2d):
                 input_channel = x.shape[1]
-                padding = base.padding[0]
-                kernel_size = base.kernel_size[0]
-                stride = base.stride[0]
-
-                mat = F.unfold(x, kernel_size=kernel_size, stride=stride, padding=padding).transpose(0, 1).reshape(
-                    kernel_size * kernel_size * input_channel, -1).cpu()
+                pool_stride = self.conv_sample_pool_stride
+                if pool_stride > 1 and x.shape[-1] >= pool_stride and x.shape[-2] >= pool_stride:
+                    x = F.avg_pool2d(x, kernel_size=pool_stride, stride=pool_stride)
+                unfolded = F.unfold(x, kernel_size=base.kernel_size, stride=base.stride, padding=base.padding)
+                mat = unfolded.permute(1, 0, 2).reshape(unfolded.shape[1], -1)
+                if mat.shape[1] > self.conv_sample_max_patches:
+                    idx = torch.randperm(mat.shape[1], device=mat.device)[:self.conv_sample_max_patches]
+                    mat = mat[:, idx]
             else:
                 return
 
@@ -317,6 +323,9 @@ class CDAD(SD_AMN):
                 self.act[name] = torch.cat([self.act[name], mat], dim=1)
             else:
                 self.act[name] = mat
+            if self.act[name].shape[1] > self.warmup_max_cols_per_layer:
+                idx = torch.randperm(self.act[name].shape[1], device=self.act[name].device)[:self.warmup_max_cols_per_layer]
+                self.act[name] = self.act[name][:, idx]
 
         return hook
 
