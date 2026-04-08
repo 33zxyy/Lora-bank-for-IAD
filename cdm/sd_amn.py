@@ -33,15 +33,15 @@ class SD_AMN(LatentDiffusion):
 
         self.log_name = log_name
 
-        self.pretrained_resnet50 = timm.create_model("resnet50", pretrained=True, features_only=True) # for inference
+        self.pretrained_resnet50 = timm.create_model("resnet50", pretrained=True, features_only=True)  # for inference
 
-        self.layers_ = layers   # for inference
+        self.layers_ = layers  # for inference
 
-        self.distance = distance    # for inference
+        self.distance = distance  # for inference
 
         self.criterion_mse = nn.MSELoss()
 
-        self.result = {'clsname':[], 'filename':[], 'pred':[], 'mask':[]}
+        self.result = {'clsname': [], 'filename': [], 'pred': [], 'mask': []}
 
         self.max_check = 0.0
         self.task_id = 0
@@ -80,7 +80,6 @@ class SD_AMN(LatentDiffusion):
             if contains_any(name, no_trained_para) and not sub_(name) in self.unet_train_param_name:
                 self.unet_train_param_name.append(sub_(name))
 
-
     def training_step(self, batch, batch_idx):
 
         for k in self.ucg_training:
@@ -113,14 +112,18 @@ class SD_AMN(LatentDiffusion):
             for name, param in self.control_model.named_parameters():
                 if sub_(name) in self.project.keys() and re.search('.weight', name):
                     param.grad.data = param.grad.data - torch.mm(param.grad.data.view(param.shape[0], -1),
-                                                                 torch.mm(self.project[sub_(name)], self.project[sub_(name)].t())).view(param.shape)
+                                                                 torch.mm(self.project[sub_(name)],
+                                                                          self.project[sub_(name)].t())).view(
+                        param.shape)
                 else:
                     param.grad.data.fill_(0.0)
 
             for name, param in self.model.diffusion_model.named_parameters():
                 if sub_(name) in self.project.keys() and re.search('.weight', name):
                     param.grad.data = (param.grad.data - torch.mm(param.grad.data.view(param.shape[0], -1),
-                                                                  torch.mm(self.project[sub_(name)], self.project[sub_(name)].t())).view(param.shape))
+                                                                  torch.mm(self.project[sub_(name)],
+                                                                           self.project[sub_(name)].t())).view(
+                        param.shape))
                 else:
                     param.grad.data.fill_(0.0)
 
@@ -145,23 +148,29 @@ class SD_AMN(LatentDiffusion):
         input_features = [input_features[i] for i in self.layers_]
         output_features = [output_features[i] for i in self.layers_]
 
-        anomaly_map, _ = cal_anomaly_map(input_features, output_features, input_img.shape[-1], amap_mode='a', dis=self.distance)
+        anomaly_map, _ = cal_anomaly_map(input_features, output_features, input_img.shape[-1], amap_mode='a',
+                                         dis=self.distance)
 
         for i in range(anomaly_map.shape[0]):
             anomaly_map[i] = gaussian_filter(anomaly_map[i], sigma=5)
         anomaly_map = torch.from_numpy(anomaly_map)
         anomaly_map_prediction = anomaly_map.unsqueeze(dim=1)
 
-        self.result['filename'] += batch["filename"]           # list:12
-        self.result['pred'] += list(anomaly_map_prediction.cpu().numpy())     # B x 1 x H x W
-        self.result['mask'] += list(batch["mask"].cpu().numpy())     # B x 1 x H x W
-        self.result['clsname'] += batch["clsname"]             # list:12
+        self.result['filename'] += batch["filename"]  # list:12
+        self.result['pred'] += list(anomaly_map_prediction.cpu().numpy())  # B x 1 x H x W
+        self.result['mask'] += list(batch["mask"].cpu().numpy())  # B x 1 x H x W
+        self.result['clsname'] += batch["clsname"]  # list:12
 
     @torch.no_grad()
     def on_validation_epoch_end(self, *args, **kwargs):
 
         # evl_metrics = {'auc': [{'name': 'max'}, {'name': 'pixel'}, {'name': 'pro'}, {'name': 'apsp'}]}
-        evl_metrics = {'auc': [{'name': 'max'}, {'name': 'pixel'}]}
+        evl_metrics = {
+            'auc': [
+                {'name': 'max', 'kwargs': {'topk_ratio': 0.01, 'smooth_kernel': 4}},
+                {'name': 'pixel'}
+            ]
+        }
         self.print("Gathering final results ...")
         fileinfos, preds, masks = merge_together(self.result)
 
@@ -179,7 +188,6 @@ class SD_AMN(LatentDiffusion):
         if val_acc > self.max_check:
             self.max_check = val_acc
             save_metrics(ret_metrics, evl_metrics, f'logs/{self.log_name}-best.csv')
-
 
     # def get_activation(self, name):
     #     def hook(model, input, output):
@@ -240,7 +248,7 @@ class SD_AMN(LatentDiffusion):
     #             act_hat = act.cuda() - self.project[name] @ self.project[name].t() @ act.cuda()
 
     #             U, S, Vh = torch.linalg.svd(act_hat)
-          
+
     #             sval_hat = (S**2).sum()
     #             sval_ratio = (S**2) / sval_total
 
@@ -322,7 +330,8 @@ class SD_AMN(LatentDiffusion):
         return self.get_learned_conditioning([""] * N)
 
     @torch.no_grad()
-    def log_images_test(self, batch, sample=False, ddim_steps=10, ddim_eta=0.0, plot_denoise_rows=False, unconditional_guidance_scale=9.0):
+    def log_images_test(self, batch, sample=False, ddim_steps=10, ddim_eta=0.0, plot_denoise_rows=False,
+                        unconditional_guidance_scale=9.0):
         use_ddim = ddim_steps is not None
 
         N = batch['jpg'].shape[0]
@@ -354,12 +363,12 @@ class SD_AMN(LatentDiffusion):
             uc_cat = c_cat  # torch.zeros_like(c_cat)
             uc_full = {"c_concat": [uc_cat], "c_crossattn": [uc_cross]}
             samples_cfg, inter = self.sample_log_test(cond={"c_concat": [c_cat], "c_crossattn": [c]},
-                                             batch_size=N, ddim=use_ddim,
-                                             ddim_steps=ddim_steps, eta=ddim_eta,
-                                             unconditional_guidance_scale=unconditional_guidance_scale,
-                                             unconditional_conditioning=uc_full,
-                                            x_T=x_noisy, timesteps=t
-                                             )
+                                                      batch_size=N, ddim=use_ddim,
+                                                      ddim_steps=ddim_steps, eta=ddim_eta,
+                                                      unconditional_guidance_scale=unconditional_guidance_scale,
+                                                      unconditional_conditioning=uc_full,
+                                                      x_T=x_noisy, timesteps=t
+                                                      )
             log["samples"] = self.decode_first_stage(samples_cfg)
             # for i in range(1, 101):
             #     log[f'samples{i}'] = self.decode_first_stage(inter['x_inter'][i])
