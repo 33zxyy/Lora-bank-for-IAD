@@ -85,13 +85,46 @@ class CDAD(SD_AMN):
     def _append_new_expert(self, trainable=True, num_new_experts=1, freeze_previous=True):
         if num_new_experts <= 0:
             return
-        for adapter in self.layer_adapters.values():
+        for key, adapter in self.layer_adapters.items():
             if freeze_previous and adapter.num_experts > 0:
                 for i in range(adapter.num_experts):
                     adapter.freeze_expert(i)
             for _ in range(num_new_experts):
                 adapter.add_expert(trainable=trainable)
                 adapter.to(adapter.module.weight.device)
+                layer_name = key.split("::", 1)[-1]
+                self._init_new_expert_from_residual(adapter, layer_name, adapter.num_experts - 1)
+
+    def _init_new_expert_from_residual(self, adapter, layer_name, expert_idx):
+        if layer_name not in self.act:
+            return
+        feat = self.act[layer_name]
+        if feat is None or feat.numel() == 0:
+            return
+
+        device = adapter.module.weight.device
+        dtype = adapter.module.weight.dtype
+        feat = feat.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            u_prev = adapter.orth_basis(upto=expert_idx)
+            if u_prev is not None and u_prev.numel() > 0:
+                u_prev = u_prev.to(device=device, dtype=dtype)
+                feat = feat - u_prev.t() @ (u_prev @ feat)
+
+            if feat.numel() == 0:
+                return
+            cov = feat @ feat.t()
+            if torch.count_nonzero(cov).item() == 0:
+                return
+
+            u_res, _, _ = torch.linalg.svd(cov, full_matrices=False)
+            rank = min(adapter.rank, u_res.shape[1])
+            if rank <= 0:
+                return
+            a, _ = adapter._get_ab(expert_idx)
+            a_init = torch.zeros_like(a)
+            a_init[:rank] = u_res[:, :rank].t()
+            a.data.copy_(a_init)
 
     def _assert_control_branch_without_lora(self):
         for module in self.control_model.modules():
