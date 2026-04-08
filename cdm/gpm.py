@@ -31,6 +31,7 @@ class CDAD(SD_AMN):
                  orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
                  warmup_novelty_batches=4, conv_sample_pool_stride=2,
                  conv_sample_max_patches=512, warmup_max_cols_per_layer=2048,
+                 layer_growth_topk=4, highres_threshold_scale=0.8, middle_attn_threshold_scale=1.2,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -49,6 +50,9 @@ class CDAD(SD_AMN):
             self.conv_sample_pool_stride = max(int(conv_sample_pool_stride), 1)
             self.conv_sample_max_patches = max(int(conv_sample_max_patches), 1)
             self.warmup_max_cols_per_layer = max(int(warmup_max_cols_per_layer), 1)
+            self.layer_growth_topk = max(int(layer_growth_topk), 0)
+            self.highres_threshold_scale = float(highres_threshold_scale)
+            self.middle_attn_threshold_scale = float(middle_attn_threshold_scale)
             self._warmup_batch_count = 0
             self._warmup_done = False
             self._warmup_hook_handle = {}
@@ -134,23 +138,52 @@ class CDAD(SD_AMN):
                 self._warmup_hook_handle[name] = module.register_forward_hook(self.get_activation(name))
 
     def _finish_task_warmup_and_grow(self):
-        novelty = self._novelty_energy()
-        current = 0
-        if len(self.layer_adapters) > 0:
-            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
-        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current)
-        if num_new_experts > 0:
-            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
+        layer_novelty = self._layer_novelty_energy()
+        ranked = []
+        for key, novelty in layer_novelty.items():
+            threshold = self._layer_novelty_threshold(key)
+            if novelty > threshold:
+                ranked.append((key, novelty, threshold))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        if self.layer_growth_topk > 0:
+            ranked = ranked[:self.layer_growth_topk]
+
+        growth_plan = {}
+        for key, novelty, threshold in ranked:
+            current = self.layer_adapters[key].num_experts
+            num_new_experts = self._compute_new_experts_from_novelty(
+                novelty, current_experts=current, threshold=threshold
+            )
+            if num_new_experts > 0:
+                growth_plan[key] = num_new_experts
+
+        if len(growth_plan) > 0:
+            self._append_new_expert_by_plan(growth_plan, trainable=True, freeze_previous=True)
             self._register_new_trainable_params_to_optimizer()
         for value in self._warmup_hook_handle.values():
             value.remove()
         self._warmup_hook_handle = {}
         self.act = {}
         self._warmup_done = True
+        avg_novelty = 0.0 if len(layer_novelty) == 0 else float(sum(layer_novelty.values()) / len(layer_novelty))
         self.logger_val.info(
-            f"[WarmupGrow] novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
-            f"new_experts={num_new_experts}, warmup_batches={self._warmup_batch_count}"
+            f"[WarmupGrow] avg_novelty={avg_novelty:.4f}, grown_layers={len(growth_plan)}, "
+            f"growth_plan={growth_plan}, warmup_batches={self._warmup_batch_count}"
         )
+
+    def _append_new_expert_by_plan(self, growth_plan, trainable=True, freeze_previous=True):
+        for key, num_new_experts in growth_plan.items():
+            if num_new_experts <= 0 or key not in self.layer_adapters:
+                continue
+            adapter = self.layer_adapters[key]
+            if freeze_previous and adapter.num_experts > 0:
+                for i in range(adapter.num_experts):
+                    adapter.freeze_expert(i)
+            for _ in range(num_new_experts):
+                adapter.add_expert(trainable=trainable)
+                adapter.to(adapter.module.weight.device)
+                layer_name = key.split("::", 1)[-1]
+                self._init_new_expert_from_residual(adapter, layer_name, adapter.num_experts - 1)
 
     def _register_new_trainable_params_to_optimizer(self):
         if self.trainer is None:
@@ -181,8 +214,17 @@ class CDAD(SD_AMN):
             loss = loss + adapter.orthogonality_loss()
         return loss
 
-    def _novelty_energy(self):
-        energies = []
+    def _layer_novelty_threshold(self, layer_key):
+        layer_name = layer_key.split("::", 1)[-1]
+        threshold = self.novelty_threshold
+        if "input_blocks" in layer_name or "output_blocks" in layer_name:
+            threshold = threshold * self.highres_threshold_scale
+        if "middle_block" in layer_name or "attn" in layer_name:
+            threshold = threshold * self.middle_attn_threshold_scale
+        return float(max(threshold, 1e-8))
+
+    def _layer_novelty_energy(self):
+        energies = {}
         for key, adapter in self.layer_adapters.items():
             if adapter.num_experts == 0:
                 continue
@@ -194,23 +236,28 @@ class CDAD(SD_AMN):
                 continue
             u_old = adapter.orth_basis(upto=adapter.num_experts)
             if u_old is None or u_old.numel() == 0:
-                energies.append(1.0)
+                energies[key] = 1.0
                 continue
             u_old = u_old.to(device=self.device)
             proj = u_old.t() @ (u_old @ feat)
             residual = feat - proj
             den = torch.norm(feat, p='fro') ** 2 + 1e-8
             num = torch.norm(residual, p='fro') ** 2
-            energies.append(float((num / den).item()))
+            energies[key] = float((num / den).item())
+        return energies
+
+    def _novelty_energy(self):
+        energies = self._layer_novelty_energy()
         if len(energies) == 0:
             return 0.0
-        return float(sum(energies) / len(energies))
+        return float(sum(energies.values()) / len(energies))
 
-    def _compute_new_experts_from_novelty(self, novelty, current_experts):
-        if novelty <= self.novelty_threshold:
+    def _compute_new_experts_from_novelty(self, novelty, current_experts, threshold=None):
+        threshold = self.novelty_threshold if threshold is None else float(threshold)
+        if novelty <= threshold:
             return 0
         step = max(self.novelty_step, 1e-8)
-        num_new_experts = 1 + int((novelty - self.novelty_threshold) / step)
+        num_new_experts = 1 + int((novelty - threshold) / step)
         num_new_experts = min(num_new_experts, self.max_new_experts_per_task)
 
         if self.max_experts_per_layer is not None:
