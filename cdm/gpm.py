@@ -32,6 +32,8 @@ class CDAD(SD_AMN):
                  warmup_novelty_batches=4, conv_sample_pool_stride=2,
                  conv_sample_max_patches=512, warmup_max_cols_per_layer=2048,
                  layer_growth_topk=4, highres_threshold_scale=0.8, middle_attn_threshold_scale=1.2,
+                 warmup_stat_layer_keywords=("input_blocks", "middle_block", "output_blocks"),
+                 warmup_stat_max_layers=24,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -53,6 +55,8 @@ class CDAD(SD_AMN):
             self.layer_growth_topk = max(int(layer_growth_topk), 0)
             self.highres_threshold_scale = float(highres_threshold_scale)
             self.middle_attn_threshold_scale = float(middle_attn_threshold_scale)
+            self.warmup_stat_layer_keywords = tuple(warmup_stat_layer_keywords or ())
+            self.warmup_stat_max_layers = max(int(warmup_stat_max_layers), 1)
             self._warmup_batch_count = 0
             self._warmup_done = False
             self._warmup_hook_handle = {}
@@ -133,11 +137,13 @@ class CDAD(SD_AMN):
         if self._warmup_done:
             return
         self.act = {}
+        stat_layers = self._select_warmup_stat_layers()
         for name, module in self.model.diffusion_model.named_modules():
-            if name in self.unet_train_param_name:
+            if name in stat_layers:
                 self._warmup_hook_handle[name] = module.register_forward_hook(self.get_activation(name))
 
     def _finish_task_warmup_and_grow(self):
+        self._finalize_warmup_activations()
         layer_novelty = self._layer_novelty_energy()
         ranked = []
         for key, novelty in layer_novelty.items():
@@ -170,6 +176,35 @@ class CDAD(SD_AMN):
             f"[WarmupGrow] avg_novelty={avg_novelty:.4f}, grown_layers={len(growth_plan)}, "
             f"growth_plan={growth_plan}, warmup_batches={self._warmup_batch_count}"
         )
+
+    def _select_warmup_stat_layers(self):
+        adapter_layers = [key.split("::", 1)[-1] for key in self.layer_adapters.keys()]
+        if len(adapter_layers) == 0:
+            return set()
+        selected = []
+        for name in adapter_layers:
+            if len(self.warmup_stat_layer_keywords) == 0:
+                selected.append(name)
+            elif any(k in name for k in self.warmup_stat_layer_keywords):
+                selected.append(name)
+        if len(selected) == 0:
+            selected = adapter_layers
+        if len(selected) > self.warmup_stat_max_layers:
+            stride = max(len(selected) // self.warmup_stat_max_layers, 1)
+            selected = selected[::stride][:self.warmup_stat_max_layers]
+        return set(selected)
+
+    def _finalize_warmup_activations(self):
+        for name, chunks in list(self.act.items()):
+            if isinstance(chunks, list):
+                if len(chunks) == 0:
+                    self.act[name] = torch.empty(0, 0, device=self.device)
+                    continue
+                mat = torch.cat(chunks, dim=1)
+                if mat.shape[1] > self.warmup_max_cols_per_layer:
+                    idx = torch.randperm(mat.shape[1], device=mat.device)[:self.warmup_max_cols_per_layer]
+                    mat = mat[:, idx]
+                self.act[name] = mat
 
     def _append_new_expert_by_plan(self, growth_plan, trainable=True, freeze_previous=True):
         for key, num_new_experts in growth_plan.items():
@@ -366,13 +401,9 @@ class CDAD(SD_AMN):
             else:
                 return
 
-            if name in self.act.keys():
-                self.act[name] = torch.cat([self.act[name], mat], dim=1)
-            else:
-                self.act[name] = mat
-            if self.act[name].shape[1] > self.warmup_max_cols_per_layer:
-                idx = torch.randperm(self.act[name].shape[1], device=self.act[name].device)[:self.warmup_max_cols_per_layer]
-                self.act[name] = self.act[name][:, idx]
+            if name not in self.act:
+                self.act[name] = []
+            self.act[name].append(mat)
 
         return hook
 
