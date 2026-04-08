@@ -91,6 +91,7 @@ class CDAD(SD_AMN):
                     adapter.freeze_expert(i)
             for _ in range(num_new_experts):
                 adapter.add_expert(trainable=trainable)
+                adapter.to(adapter.module.weight.device)
 
     def _assert_control_branch_without_lora(self):
         for module in self.control_model.modules():

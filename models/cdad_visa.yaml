@@ -48,10 +48,10 @@ model:
     log_every_t: 200
     log_name: encoder_decoder_4-23_woTimemb
     lora_alpha: 1.0
-    lora_rank: 16
+    lora_rank: 8
     init_experts: 1
     adaptive_init_on_task0: true
-    max_experts_per_layer: 8
+    max_experts_per_layer: 10
     max_new_experts_per_task: 2
     router_topk: 2
     warmup_novelty_batches: 4
