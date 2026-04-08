@@ -33,7 +33,9 @@ class CDAD(SD_AMN):
                  conv_sample_max_patches=512, warmup_max_cols_per_layer=2048,
                  layer_growth_topk=4, highres_threshold_scale=0.8, middle_attn_threshold_scale=1.2,
                  warmup_stat_layer_keywords=("input_blocks", "middle_block", "output_blocks"),
-                 warmup_stat_max_layers=24,
+                 warmup_stat_max_layers=24, task0_warmup_novelty_batches=2,
+                 control_lr=1e-5, lora_lr=3e-5, router_lr=5e-5,
+                 conv_highres_rank=16, attn_middle_rank=8,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -57,8 +59,15 @@ class CDAD(SD_AMN):
             self.middle_attn_threshold_scale = float(middle_attn_threshold_scale)
             self.warmup_stat_layer_keywords = tuple(warmup_stat_layer_keywords or ())
             self.warmup_stat_max_layers = max(int(warmup_stat_max_layers), 1)
+            self.task0_warmup_novelty_batches = max(int(task0_warmup_novelty_batches), 1)
+            self.control_lr = float(control_lr)
+            self.lora_lr = float(lora_lr)
+            self.router_lr = float(router_lr)
+            self.conv_highres_rank = max(int(conv_highres_rank), 1)
+            self.attn_middle_rank = max(int(attn_middle_rank), 1)
             self._warmup_batch_count = 0
             self._warmup_done = False
+            self._current_warmup_novelty_batches = self.warmup_novelty_batches
             self._warmup_hook_handle = {}
             if orth_constraint_mode not in ("soft", "hard"):
                 raise ValueError(f"orth_constraint_mode must be 'soft' or 'hard', got {orth_constraint_mode}")
@@ -66,13 +75,17 @@ class CDAD(SD_AMN):
             self.layer_adapters = {}
             self._attach_lora_adapters()
             self._assert_control_branch_without_lora()
-            init_num_experts = self.init_experts
-            if self.adaptive_init_on_task0:
-                # Before task0 we do not have previous task statistics yet.
-                # Use maximal novelty proxy (1.0) with the same growth rule.
-                init_num_experts = self._compute_new_experts_from_novelty(1.0, current_experts=0)
-                init_num_experts = max(init_num_experts, 1)
+            # Task0 starts with a minimal expert set; additional growth is decided
+            # by real warmup novelty statistics instead of a fixed proxy novelty.
+            init_num_experts = 1
             self._append_new_expert(trainable=True, num_new_experts=init_num_experts, freeze_previous=False)
+
+    def _rank_for_layer(self, layer_name, module):
+        if isinstance(module, nn.Conv2d) and ("input_blocks" in layer_name or "output_blocks" in layer_name):
+            return self.conv_highres_rank
+        if isinstance(module, nn.Linear) and ("attn" in layer_name or "middle_block" in layer_name):
+            return self.attn_middle_rank
+        return self.lora_rank
 
     def _attach_lora_adapters(self):
         # Keep LoRA on diffusion UNet only; AMN/control branch runs without LoRA.
@@ -85,7 +98,7 @@ class CDAD(SD_AMN):
                     parent_name) if parent_name else self.model.diffusion_model
                 adapter = AdditiveLoRAAdapter(
                     module,
-                    rank=self.lora_rank,
+                    rank=self._rank_for_layer(name, module),
                     alpha=self.lora_alpha,
                     max_experts=max(self.max_experts_per_layer or 0, 32)
                 )
@@ -132,7 +145,11 @@ class CDAD(SD_AMN):
 
     def _start_task_warmup(self):
         self._warmup_batch_count = 0
-        self._warmup_done = (self.warmup_novelty_batches is None or self.warmup_novelty_batches <= 0)
+        self._current_warmup_novelty_batches = self.warmup_novelty_batches
+        if getattr(self, "task_id", 0) == 0:
+            self._current_warmup_novelty_batches = min(self._current_warmup_novelty_batches,
+                                                       self.task0_warmup_novelty_batches)
+        self._warmup_done = (self._current_warmup_novelty_batches is None or self._current_warmup_novelty_batches <= 0)
         self._warmup_hook_handle = {}
         if self._warmup_done:
             return
@@ -174,7 +191,8 @@ class CDAD(SD_AMN):
         avg_novelty = 0.0 if len(layer_novelty) == 0 else float(sum(layer_novelty.values()) / len(layer_novelty))
         self.logger_val.info(
             f"[WarmupGrow] avg_novelty={avg_novelty:.4f}, grown_layers={len(growth_plan)}, "
-            f"growth_plan={growth_plan}, warmup_batches={self._warmup_batch_count}"
+            f"growth_plan={growth_plan}, warmup_batches={self._warmup_batch_count}, "
+            f"target_warmup_batches={self._current_warmup_novelty_batches}"
         )
 
     def _select_warmup_stat_layers(self):
@@ -227,19 +245,23 @@ class CDAD(SD_AMN):
         if opt is None:
             return
         existing = {id(p) for group in opt.param_groups for p in group['params']}
-        new_params = []
+        new_lora_params, new_router_gate_params = [], []
         for adapter in self.layer_adapters.values():
             for i in range(adapter.num_experts):
                 a, b = adapter._get_ab(i)
                 g = adapter.expert_gates[i]
-                for p in (a, b, g):
+                for p in (a, b):
                     if p.requires_grad and id(p) not in existing:
-                        new_params.append(p)
+                        new_lora_params.append(p)
+                if g.requires_grad and id(g) not in existing:
+                    new_router_gate_params.append(g)
             for p in adapter.router.parameters():
                 if p.requires_grad and id(p) not in existing:
-                    new_params.append(p)
-        if len(new_params) > 0:
-            opt.add_param_group({"params": new_params})
+                    new_router_gate_params.append(p)
+        if len(new_lora_params) > 0:
+            opt.add_param_group({"params": new_lora_params, "lr": self.lora_lr})
+        if len(new_router_gate_params) > 0:
+            opt.add_param_group({"params": new_router_gate_params, "lr": self.router_lr})
 
     def _orthogonal_regularization(self):
         if not self.layer_adapters:
@@ -301,17 +323,18 @@ class CDAD(SD_AMN):
         return max(num_new_experts, 0)
 
     def configure_optimizers(self):
-        lr = self.learning_rate
         lora_trainable = []
+        router_gate_trainable = []
         for adapter in self.layer_adapters.values():
             for p in adapter.router.parameters():
                 if p.requires_grad:
-                    lora_trainable.append(p)
+                    router_gate_trainable.append(p)
             for i in range(adapter.num_experts):
                 a, b = adapter._get_ab(i)
                 g = adapter.expert_gates[i]
                 if a.requires_grad:
-                    lora_trainable.extend([a, b, g])
+                    lora_trainable.extend([a, b])
+                    router_gate_trainable.append(g)
 
         control_trainable = list(self.control_model.parameters())
         for p in control_trainable:
@@ -320,16 +343,23 @@ class CDAD(SD_AMN):
         for p in self.model.diffusion_model.parameters():
             p.requires_grad = False
 
-        for p in lora_trainable:
+        for p in (lora_trainable + router_gate_trainable):
             p.requires_grad = True
 
-        trainable = control_trainable + lora_trainable
+        trainable = control_trainable + lora_trainable + router_gate_trainable
         if len(trainable) == 0:
             raise RuntimeError(
                 "No trainable parameters were found for control branch or LoRA adapters."
             )
 
-        opt = torch.optim.AdamW(trainable, lr=lr)
+        param_groups = []
+        if len(control_trainable) > 0:
+            param_groups.append({"params": control_trainable, "lr": self.control_lr})
+        if len(lora_trainable) > 0:
+            param_groups.append({"params": lora_trainable, "lr": self.lora_lr})
+        if len(router_gate_trainable) > 0:
+            param_groups.append({"params": router_gate_trainable, "lr": self.router_lr})
+        opt = torch.optim.AdamW(param_groups, lr=self.learning_rate)
         return opt
 
     @torch.no_grad()
@@ -371,7 +401,7 @@ class CDAD(SD_AMN):
         opt.step()
         if not self._warmup_done:
             self._warmup_batch_count += 1
-            if self._warmup_batch_count >= self.warmup_novelty_batches:
+            if self._warmup_batch_count >= self._current_warmup_novelty_batches:
                 self._finish_task_warmup_and_grow()
 
     def on_train_start(self):
