@@ -29,7 +29,7 @@ class CDAD(SD_AMN):
     def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
                  init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
                  orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
-                 warmup_novelty_batches=4,
+                 warmup_novelty_batches=4, grow_topk_layers=None,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -45,6 +45,7 @@ class CDAD(SD_AMN):
             self.adaptive_init_on_task0 = adaptive_init_on_task0
             self.router_topk = router_topk
             self.warmup_novelty_batches = warmup_novelty_batches
+            self.grow_topk_layers = grow_topk_layers
             self._warmup_batch_count = 0
             self._warmup_done = False
             self._warmup_hook_handle = {}
@@ -82,14 +83,19 @@ class CDAD(SD_AMN):
                 setattr(parent, attr_name, adapter)
                 self.layer_adapters[f"diffusion::{name}"] = adapter
 
-    def _append_new_expert(self, trainable=True, num_new_experts=1, freeze_previous=True):
-        if num_new_experts <= 0:
+    def _append_new_expert(self, trainable=True, num_new_experts=1, freeze_previous=True, growth_plan=None):
+        if growth_plan is None and num_new_experts <= 0:
             return
+        if growth_plan is None:
+            growth_plan = {key: num_new_experts for key in self.layer_adapters.keys()}
         for key, adapter in self.layer_adapters.items():
+            layer_new_experts = int(growth_plan.get(key, 0))
+            if layer_new_experts <= 0:
+                continue
             if freeze_previous and adapter.num_experts > 0:
                 for i in range(adapter.num_experts):
                     adapter.freeze_expert(i)
-            for _ in range(num_new_experts):
+            for _ in range(layer_new_experts):
                 adapter.add_expert(trainable=trainable)
                 adapter.to(adapter.module.weight.device)
                 layer_name = key.split("::", 1)[-1]
@@ -143,23 +149,55 @@ class CDAD(SD_AMN):
                 self._warmup_hook_handle[name] = module.register_forward_hook(self.get_activation(name))
 
     def _finish_task_warmup_and_grow(self):
-        novelty = self._novelty_energy()
-        current = 0
-        if len(self.layer_adapters) > 0:
-            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
-        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current)
-        if num_new_experts > 0:
-            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
+        layer_novelties = self._layer_novelty_energy()
+        growth_plan = self._build_growth_plan(layer_novelties)
+        if len(growth_plan) > 0:
+            self._append_new_expert(
+                trainable=True,
+                freeze_previous=True,
+                growth_plan=growth_plan
+            )
             self._register_new_trainable_params_to_optimizer()
         for value in self._warmup_hook_handle.values():
             value.remove()
         self._warmup_hook_handle = {}
         self.act = {}
         self._warmup_done = True
+        novelty = self._novelty_energy(layer_novelties=layer_novelties)
+        total_new = sum(growth_plan.values()) if len(growth_plan) > 0 else 0
         self.logger_val.info(
             f"[WarmupGrow] novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
-            f"new_experts={num_new_experts}, warmup_batches={self._warmup_batch_count}"
+            f"new_experts={total_new}, grown_layers={len(growth_plan)}, "
+            f"warmup_batches={self._warmup_batch_count}"
         )
+
+    def _layer_growth_threshold(self, layer_name):
+        threshold = self.novelty_threshold
+        if "input_blocks" in layer_name or "output_blocks" in layer_name:
+            return threshold * 0.8
+        if "middle_block" in layer_name or "attn" in layer_name:
+            return threshold * 1.2
+        return threshold
+
+    def _build_growth_plan(self, layer_novelties):
+        plan = []
+        for key, adapter in self.layer_adapters.items():
+            layer_name = key.split("::", 1)[-1]
+            novelty = layer_novelties.get(layer_name, 0.0)
+            threshold = self._layer_growth_threshold(layer_name)
+            if novelty <= threshold:
+                continue
+            num_new = self._compute_new_experts_from_novelty(
+                novelty, current_experts=adapter.num_experts
+            )
+            if num_new > 0:
+                plan.append((key, novelty, num_new))
+
+        if self.grow_topk_layers is not None and int(self.grow_topk_layers) > 0:
+            k = int(self.grow_topk_layers)
+            plan = sorted(plan, key=lambda x: x[1], reverse=True)[:k]
+
+        return {key: num_new for key, _, num_new in plan}
 
     def _register_new_trainable_params_to_optimizer(self):
         if self.trainer is None:
@@ -190,8 +228,8 @@ class CDAD(SD_AMN):
             loss = loss + adapter.orthogonality_loss()
         return loss
 
-    def _novelty_energy(self):
-        energies = []
+    def _layer_novelty_energy(self):
+        energies = {}
         for key, adapter in self.layer_adapters.items():
             if adapter.num_experts == 0:
                 continue
@@ -203,14 +241,20 @@ class CDAD(SD_AMN):
                 continue
             u_old = adapter.orth_basis(upto=adapter.num_experts)
             if u_old is None or u_old.numel() == 0:
-                energies.append(1.0)
+                energies[layer_name] = 1.0
                 continue
             u_old = u_old.to(device=self.device)
             proj = u_old.t() @ (u_old @ feat)
             residual = feat - proj
             den = torch.norm(feat, p='fro') ** 2 + 1e-8
             num = torch.norm(residual, p='fro') ** 2
-            energies.append(float((num / den).item()))
+            energies[layer_name] = float((num / den).item())
+        return energies
+
+    def _novelty_energy(self, layer_novelties=None):
+        if layer_novelties is None:
+            layer_novelties = self._layer_novelty_energy()
+        energies = list(layer_novelties.values())
         if len(energies) == 0:
             return 0.0
         return float(sum(energies) / len(energies))
@@ -351,22 +395,21 @@ class CDAD(SD_AMN):
 
     @torch.no_grad()
     def on_test_end(self):
-        novelty = self._novelty_energy()
-        grow = novelty > self.novelty_threshold
-        current = 0
-        if len(self.layer_adapters) > 0:
-            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
-        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current) if grow else 0
+        layer_novelties = self._layer_novelty_energy()
+        novelty = self._novelty_energy(layer_novelties=layer_novelties)
+        growth_plan = self._build_growth_plan(layer_novelties)
+        grow = len(growth_plan) > 0
+        total_new = sum(growth_plan.values()) if grow else 0
 
-        if num_new_experts > 0:
-            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
+        if grow:
+            self._append_new_expert(trainable=True, freeze_previous=True, growth_plan=growth_plan)
 
         for value in self.hook_handle.values():
             value.remove()
 
         self.logger_val.info(
             f"LoRA novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
-            f"grow={grow}, new_experts={num_new_experts}"
+            f"grow={grow}, new_experts={total_new}, grown_layers={len(growth_plan)}"
         )
         self.task_id += 1
         self.max_check = 0.0

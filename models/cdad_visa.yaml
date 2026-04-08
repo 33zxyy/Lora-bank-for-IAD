@@ -55,6 +55,7 @@ model:
     max_new_experts_per_task: 2
     router_topk: 2
     warmup_novelty_batches: 4
+    grow_topk_layers: 6
     novelty_step: 0.1
     monitor: val/loss_simple_ema
     novelty_threshold: 0.2
