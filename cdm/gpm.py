@@ -96,35 +96,22 @@ class CDAD(SD_AMN):
                 self._init_new_expert_from_residual(adapter, layer_name, adapter.num_experts - 1)
 
     def _init_new_expert_from_residual(self, adapter, layer_name, expert_idx):
-        if layer_name not in self.act:
-            return
-        feat = self.act[layer_name]
-        if feat is None or feat.numel() == 0:
-            return
-
         device = adapter.module.weight.device
         dtype = adapter.module.weight.dtype
-        feat = feat.to(device=device, dtype=dtype)
         with torch.no_grad():
+            a, b = adapter._get_ab(expert_idx)
+            # Random init + projection to the orthogonal complement of previous experts.
+            a_rand = torch.empty_like(a)
+            nn.init.kaiming_uniform_(a_rand, a=5 ** 0.5)
+
             u_prev = adapter.orth_basis(upto=expert_idx)
             if u_prev is not None and u_prev.numel() > 0:
                 u_prev = u_prev.to(device=device, dtype=dtype)
-                feat = feat - u_prev.t() @ (u_prev @ feat)
+                a_rand = a_rand - (a_rand @ u_prev.t()) @ u_prev
 
-            if feat.numel() == 0:
-                return
-            cov = feat @ feat.t()
-            if torch.count_nonzero(cov).item() == 0:
-                return
-
-            u_res, _, _ = torch.linalg.svd(cov, full_matrices=False)
-            rank = min(adapter.rank, u_res.shape[1])
-            if rank <= 0:
-                return
-            a, _ = adapter._get_ab(expert_idx)
-            a_init = torch.zeros_like(a)
-            a_init[:rank] = u_res[:, :rank].t()
-            a.data.copy_(a_init)
+            a.data.copy_(a_rand)
+            b.data.zero_()
+            adapter.expert_gates[expert_idx].data.fill_(-2.0)
 
     def _assert_control_branch_without_lora(self):
         for module in self.control_model.modules():
@@ -339,48 +326,16 @@ class CDAD(SD_AMN):
             _ = self.log_images_test(batch)
 
     @torch.no_grad()
-    def on_test_batch_end(self, outputs, batch, batch_idx, dataloader_idx):
-        if batch_idx % 10 == 0:
-            for name, act in self.act.items():
-                U, S, Vh = torch.linalg.svd(act.cuda(), full_matrices=False)
-
-                sval_total = (S ** 2).sum()
-                sval_ratio = (S ** 2) / sval_total
-                r = max(torch.sum(torch.cumsum(sval_ratio, dim=0) < 0.999), 1)
-                self.act[name] = U[:, :r].cpu()
-
-    @torch.no_grad()
     def on_test_end(self):
-        novelty = self._novelty_energy()
-        grow = novelty > self.novelty_threshold
-        current = 0
-        if len(self.layer_adapters) > 0:
-            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
-        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current) if grow else 0
-
-        if num_new_experts > 0:
-            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
-
         for value in self.hook_handle.values():
             value.remove()
 
         self.logger_val.info(
-            f"LoRA novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
-            f"grow={grow}, new_experts={num_new_experts}"
+            "Skip test-end LoRA growth; warmup-growth is the only growth path."
         )
         self.task_id += 1
         self.max_check = 0.0
 
     @torch.no_grad()
     def on_test_start(self):
-
         self.hook_handle = {}
-        del self.act
-        self.act = {}
-        for name, module in self.model.diffusion_model.named_modules():
-            if name in self.unet_train_param_name:
-                self.hook_handle[name] = module.register_forward_hook(self.get_activation(name))
-
-        for name, module in self.control_model.named_modules():
-            if name in self.control_train_param_name:
-                self.hook_handle[name] = module.register_forward_hook(self.get_activation(name))
