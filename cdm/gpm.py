@@ -29,7 +29,11 @@ class CDAD(SD_AMN):
     def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
                  init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
                  orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
-                 warmup_novelty_batches=4,
+                 warmup_novelty_batches=4, conv_sample_pool_stride=2,
+                 conv_sample_max_patches=512, warmup_max_cols_per_layer=2048,
+                 layer_growth_topk=4, highres_threshold_scale=0.8, middle_attn_threshold_scale=1.2,
+                 warmup_stat_layer_keywords=("input_blocks", "middle_block", "output_blocks"),
+                 warmup_stat_max_layers=24,
                  *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.project = {}
@@ -45,6 +49,14 @@ class CDAD(SD_AMN):
             self.adaptive_init_on_task0 = adaptive_init_on_task0
             self.router_topk = router_topk
             self.warmup_novelty_batches = warmup_novelty_batches
+            self.conv_sample_pool_stride = max(int(conv_sample_pool_stride), 1)
+            self.conv_sample_max_patches = max(int(conv_sample_max_patches), 1)
+            self.warmup_max_cols_per_layer = max(int(warmup_max_cols_per_layer), 1)
+            self.layer_growth_topk = max(int(layer_growth_topk), 0)
+            self.highres_threshold_scale = float(highres_threshold_scale)
+            self.middle_attn_threshold_scale = float(middle_attn_threshold_scale)
+            self.warmup_stat_layer_keywords = tuple(warmup_stat_layer_keywords or ())
+            self.warmup_stat_max_layers = max(int(warmup_stat_max_layers), 1)
             self._warmup_batch_count = 0
             self._warmup_done = False
             self._warmup_hook_handle = {}
@@ -96,35 +108,22 @@ class CDAD(SD_AMN):
                 self._init_new_expert_from_residual(adapter, layer_name, adapter.num_experts - 1)
 
     def _init_new_expert_from_residual(self, adapter, layer_name, expert_idx):
-        if layer_name not in self.act:
-            return
-        feat = self.act[layer_name]
-        if feat is None or feat.numel() == 0:
-            return
-
         device = adapter.module.weight.device
         dtype = adapter.module.weight.dtype
-        feat = feat.to(device=device, dtype=dtype)
         with torch.no_grad():
+            a, b = adapter._get_ab(expert_idx)
+            # Random init + projection to the orthogonal complement of previous experts.
+            a_rand = torch.empty_like(a)
+            nn.init.kaiming_uniform_(a_rand, a=5 ** 0.5)
+
             u_prev = adapter.orth_basis(upto=expert_idx)
             if u_prev is not None and u_prev.numel() > 0:
                 u_prev = u_prev.to(device=device, dtype=dtype)
-                feat = feat - u_prev.t() @ (u_prev @ feat)
+                a_rand = a_rand - (a_rand @ u_prev.t()) @ u_prev
 
-            if feat.numel() == 0:
-                return
-            cov = feat @ feat.t()
-            if torch.count_nonzero(cov).item() == 0:
-                return
-
-            u_res, _, _ = torch.linalg.svd(cov, full_matrices=False)
-            rank = min(adapter.rank, u_res.shape[1])
-            if rank <= 0:
-                return
-            a, _ = adapter._get_ab(expert_idx)
-            a_init = torch.zeros_like(a)
-            a_init[:rank] = u_res[:, :rank].t()
-            a.data.copy_(a_init)
+            a.data.copy_(a_rand)
+            b.data.zero_()
+            adapter.expert_gates[expert_idx].data.fill_(-2.0)
 
     def _assert_control_branch_without_lora(self):
         for module in self.control_model.modules():
@@ -138,28 +137,88 @@ class CDAD(SD_AMN):
         if self._warmup_done:
             return
         self.act = {}
+        stat_layers = self._select_warmup_stat_layers()
         for name, module in self.model.diffusion_model.named_modules():
-            if name in self.unet_train_param_name:
+            if name in stat_layers:
                 self._warmup_hook_handle[name] = module.register_forward_hook(self.get_activation(name))
 
     def _finish_task_warmup_and_grow(self):
-        novelty = self._novelty_energy()
-        current = 0
-        if len(self.layer_adapters) > 0:
-            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
-        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current)
-        if num_new_experts > 0:
-            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
+        self._finalize_warmup_activations()
+        layer_novelty = self._layer_novelty_energy()
+        ranked = []
+        for key, novelty in layer_novelty.items():
+            threshold = self._layer_novelty_threshold(key)
+            if novelty > threshold:
+                ranked.append((key, novelty, threshold))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        if self.layer_growth_topk > 0:
+            ranked = ranked[:self.layer_growth_topk]
+
+        growth_plan = {}
+        for key, novelty, threshold in ranked:
+            current = self.layer_adapters[key].num_experts
+            num_new_experts = self._compute_new_experts_from_novelty(
+                novelty, current_experts=current, threshold=threshold
+            )
+            if num_new_experts > 0:
+                growth_plan[key] = num_new_experts
+
+        if len(growth_plan) > 0:
+            self._append_new_expert_by_plan(growth_plan, trainable=True, freeze_previous=True)
             self._register_new_trainable_params_to_optimizer()
         for value in self._warmup_hook_handle.values():
             value.remove()
         self._warmup_hook_handle = {}
         self.act = {}
         self._warmup_done = True
+        avg_novelty = 0.0 if len(layer_novelty) == 0 else float(sum(layer_novelty.values()) / len(layer_novelty))
         self.logger_val.info(
-            f"[WarmupGrow] novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
-            f"new_experts={num_new_experts}, warmup_batches={self._warmup_batch_count}"
+            f"[WarmupGrow] avg_novelty={avg_novelty:.4f}, grown_layers={len(growth_plan)}, "
+            f"growth_plan={growth_plan}, warmup_batches={self._warmup_batch_count}"
         )
+
+    def _select_warmup_stat_layers(self):
+        adapter_layers = [key.split("::", 1)[-1] for key in self.layer_adapters.keys()]
+        if len(adapter_layers) == 0:
+            return set()
+        selected = []
+        for name in adapter_layers:
+            if len(self.warmup_stat_layer_keywords) == 0:
+                selected.append(name)
+            elif any(k in name for k in self.warmup_stat_layer_keywords):
+                selected.append(name)
+        if len(selected) == 0:
+            selected = adapter_layers
+        if len(selected) > self.warmup_stat_max_layers:
+            stride = max(len(selected) // self.warmup_stat_max_layers, 1)
+            selected = selected[::stride][:self.warmup_stat_max_layers]
+        return set(selected)
+
+    def _finalize_warmup_activations(self):
+        for name, chunks in list(self.act.items()):
+            if isinstance(chunks, list):
+                if len(chunks) == 0:
+                    self.act[name] = torch.empty(0, 0, device=self.device)
+                    continue
+                mat = torch.cat(chunks, dim=1)
+                if mat.shape[1] > self.warmup_max_cols_per_layer:
+                    idx = torch.randperm(mat.shape[1], device=mat.device)[:self.warmup_max_cols_per_layer]
+                    mat = mat[:, idx]
+                self.act[name] = mat
+
+    def _append_new_expert_by_plan(self, growth_plan, trainable=True, freeze_previous=True):
+        for key, num_new_experts in growth_plan.items():
+            if num_new_experts <= 0 or key not in self.layer_adapters:
+                continue
+            adapter = self.layer_adapters[key]
+            if freeze_previous and adapter.num_experts > 0:
+                for i in range(adapter.num_experts):
+                    adapter.freeze_expert(i)
+            for _ in range(num_new_experts):
+                adapter.add_expert(trainable=trainable)
+                adapter.to(adapter.module.weight.device)
+                layer_name = key.split("::", 1)[-1]
+                self._init_new_expert_from_residual(adapter, layer_name, adapter.num_experts - 1)
 
     def _register_new_trainable_params_to_optimizer(self):
         if self.trainer is None:
@@ -190,8 +249,17 @@ class CDAD(SD_AMN):
             loss = loss + adapter.orthogonality_loss()
         return loss
 
-    def _novelty_energy(self):
-        energies = []
+    def _layer_novelty_threshold(self, layer_key):
+        layer_name = layer_key.split("::", 1)[-1]
+        threshold = self.novelty_threshold
+        if "input_blocks" in layer_name or "output_blocks" in layer_name:
+            threshold = threshold * self.highres_threshold_scale
+        if "middle_block" in layer_name or "attn" in layer_name:
+            threshold = threshold * self.middle_attn_threshold_scale
+        return float(max(threshold, 1e-8))
+
+    def _layer_novelty_energy(self):
+        energies = {}
         for key, adapter in self.layer_adapters.items():
             if adapter.num_experts == 0:
                 continue
@@ -203,23 +271,28 @@ class CDAD(SD_AMN):
                 continue
             u_old = adapter.orth_basis(upto=adapter.num_experts)
             if u_old is None or u_old.numel() == 0:
-                energies.append(1.0)
+                energies[key] = 1.0
                 continue
             u_old = u_old.to(device=self.device)
             proj = u_old.t() @ (u_old @ feat)
             residual = feat - proj
             den = torch.norm(feat, p='fro') ** 2 + 1e-8
             num = torch.norm(residual, p='fro') ** 2
-            energies.append(float((num / den).item()))
+            energies[key] = float((num / den).item())
+        return energies
+
+    def _novelty_energy(self):
+        energies = self._layer_novelty_energy()
         if len(energies) == 0:
             return 0.0
-        return float(sum(energies) / len(energies))
+        return float(sum(energies.values()) / len(energies))
 
-    def _compute_new_experts_from_novelty(self, novelty, current_experts):
-        if novelty <= self.novelty_threshold:
+    def _compute_new_experts_from_novelty(self, novelty, current_experts, threshold=None):
+        threshold = self.novelty_threshold if threshold is None else float(threshold)
+        if novelty <= threshold:
             return 0
         step = max(self.novelty_step, 1e-8)
-        num_new_experts = 1 + int((novelty - self.novelty_threshold) / step)
+        num_new_experts = 1 + int((novelty - threshold) / step)
         num_new_experts = min(num_new_experts, self.max_new_experts_per_task)
 
         if self.max_experts_per_layer is not None:
@@ -313,23 +386,24 @@ class CDAD(SD_AMN):
                     or isinstance(base, MultiheadAttention)):
 
                 input_channel = x.shape[-1]
-                mat = x.reshape(-1, input_channel).t().cpu()
+                mat = x.reshape(-1, input_channel).t()
 
             elif isinstance(base, nn.Conv2d):
                 input_channel = x.shape[1]
-                padding = base.padding[0]
-                kernel_size = base.kernel_size[0]
-                stride = base.stride[0]
-
-                mat = F.unfold(x, kernel_size=kernel_size, stride=stride, padding=padding).transpose(0, 1).reshape(
-                    kernel_size * kernel_size * input_channel, -1).cpu()
+                pool_stride = self.conv_sample_pool_stride
+                if pool_stride > 1 and x.shape[-1] >= pool_stride and x.shape[-2] >= pool_stride:
+                    x = F.avg_pool2d(x, kernel_size=pool_stride, stride=pool_stride)
+                unfolded = F.unfold(x, kernel_size=base.kernel_size, stride=base.stride, padding=base.padding)
+                mat = unfolded.permute(1, 0, 2).reshape(unfolded.shape[1], -1)
+                if mat.shape[1] > self.conv_sample_max_patches:
+                    idx = torch.randperm(mat.shape[1], device=mat.device)[:self.conv_sample_max_patches]
+                    mat = mat[:, idx]
             else:
                 return
 
-            if name in self.act.keys():
-                self.act[name] = torch.cat([self.act[name], mat], dim=1)
-            else:
-                self.act[name] = mat
+            if name not in self.act:
+                self.act[name] = []
+            self.act[name].append(mat)
 
         return hook
 
@@ -339,48 +413,16 @@ class CDAD(SD_AMN):
             _ = self.log_images_test(batch)
 
     @torch.no_grad()
-    def on_test_batch_end(self, outputs, batch, batch_idx, dataloader_idx):
-        if batch_idx % 10 == 0:
-            for name, act in self.act.items():
-                U, S, Vh = torch.linalg.svd(act.cuda(), full_matrices=False)
-
-                sval_total = (S ** 2).sum()
-                sval_ratio = (S ** 2) / sval_total
-                r = max(torch.sum(torch.cumsum(sval_ratio, dim=0) < 0.999), 1)
-                self.act[name] = U[:, :r].cpu()
-
-    @torch.no_grad()
     def on_test_end(self):
-        novelty = self._novelty_energy()
-        grow = novelty > self.novelty_threshold
-        current = 0
-        if len(self.layer_adapters) > 0:
-            current = min(adapter.num_experts for adapter in self.layer_adapters.values())
-        num_new_experts = self._compute_new_experts_from_novelty(novelty, current_experts=current) if grow else 0
-
-        if num_new_experts > 0:
-            self._append_new_expert(trainable=True, num_new_experts=num_new_experts, freeze_previous=True)
-
         for value in self.hook_handle.values():
             value.remove()
 
         self.logger_val.info(
-            f"LoRA novelty={novelty:.4f}, threshold={self.novelty_threshold:.4f}, "
-            f"grow={grow}, new_experts={num_new_experts}"
+            "Skip test-end LoRA growth; warmup-growth is the only growth path."
         )
         self.task_id += 1
         self.max_check = 0.0
 
     @torch.no_grad()
     def on_test_start(self):
-
         self.hook_handle = {}
-        del self.act
-        self.act = {}
-        for name, module in self.model.diffusion_model.named_modules():
-            if name in self.unet_train_param_name:
-                self.hook_handle[name] = module.register_forward_hook(self.get_activation(name))
-
-        for name, module in self.control_model.named_modules():
-            if name in self.control_train_param_name:
-                self.hook_handle[name] = module.register_forward_hook(self.get_activation(name))
