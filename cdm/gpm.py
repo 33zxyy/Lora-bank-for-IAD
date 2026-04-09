@@ -40,6 +40,7 @@ class CDAD(SD_AMN):
                  layer_growth_topk=8, highres_threshold_scale=0.8, middle_attn_threshold_scale=1.2,
                  warmup_stat_layer_keywords=("input_blocks", "middle_block", "output_blocks"),
                  warmup_stat_max_layers=24, task0_warmup_novelty_batches=6,
+                 task0_max_new_experts_per_task=4,
                  control_lr=1e-5, lora_lr=3e-5, router_lr=5e-5,
                  conv_highres_rank=16, attn_middle_rank=8,
                  *args, **kwargs):
@@ -66,6 +67,7 @@ class CDAD(SD_AMN):
             self.warmup_stat_layer_keywords = tuple(warmup_stat_layer_keywords or ())
             self.warmup_stat_max_layers = max(int(warmup_stat_max_layers), 1)
             self.task0_warmup_novelty_batches = max(int(task0_warmup_novelty_batches), 1)
+            self.task0_max_new_experts_per_task = max(int(task0_max_new_experts_per_task), 1)
             self.control_lr = float(control_lr)
             self.lora_lr = float(lora_lr)
             self.router_lr = float(router_lr)
@@ -167,15 +169,21 @@ class CDAD(SD_AMN):
     def _finish_task_warmup_and_grow(self):
         self._finalize_warmup_activations()
         layer_novelty = self._layer_novelty_energy()
+        current_max_new_experts_per_task = self.max_new_experts_per_task
+        if getattr(self, "task_id", 0) == 0:
+            current_max_new_experts_per_task = self.task0_max_new_experts_per_task
         growth_plan, diagnostics = build_growth_plan_and_diagnostics(
             layer_novelty=layer_novelty,
             layer_adapters=self.layer_adapters,
             max_experts_per_layer=self.max_experts_per_layer,
             layer_growth_topk=self.layer_growth_topk,
             novelty_step=self.novelty_step,
-            max_new_experts_per_task=self.max_new_experts_per_task,
+            max_new_experts_per_task=current_max_new_experts_per_task,
             layer_threshold_fn=self._layer_novelty_threshold,
-            compute_new_experts_fn=self._compute_new_experts_from_novelty,
+            compute_new_experts_fn=lambda novelty, current_experts, threshold: self._compute_new_experts_from_novelty(
+                novelty, current_experts=current_experts, threshold=threshold,
+                max_new_experts_cap=current_max_new_experts_per_task
+            ),
         )
 
         if len(growth_plan) > 0:
@@ -190,7 +198,8 @@ class CDAD(SD_AMN):
         self.logger_val.info(
             f"[WarmupGrow] avg_novelty={avg_novelty:.4f}, grown_layers={len(growth_plan)}, "
             f"growth_plan={growth_plan}, warmup_batches={self._warmup_batch_count}, "
-            f"target_warmup_batches={self._current_warmup_novelty_batches}"
+            f"target_warmup_batches={self._current_warmup_novelty_batches}, "
+            f"max_new_experts_cap={current_max_new_experts_per_task}"
         )
         log_growth_diagnostics(self.logger_val, diagnostics)
         log_post_growth(self.logger_val, diagnostics, self.layer_adapters)
@@ -309,12 +318,13 @@ class CDAD(SD_AMN):
             return 0.0
         return float(sum(energies.values()) / len(energies))
 
-    def _compute_new_experts_from_novelty(self, novelty, current_experts, threshold=None):
+    def _compute_new_experts_from_novelty(self, novelty, current_experts, threshold=None, max_new_experts_cap=None):
         threshold = self.novelty_threshold if threshold is None else float(threshold)
         num_new_experts = compute_raw_expert_request(novelty, threshold, self.novelty_step)
         if num_new_experts <= 0:
             return 0
-        num_new_experts = min(num_new_experts, self.max_new_experts_per_task)
+        cap = self.max_new_experts_per_task if max_new_experts_cap is None else max(int(max_new_experts_cap), 0)
+        num_new_experts = min(num_new_experts, cap)
 
         if self.max_experts_per_layer is not None:
             room = max(self.max_experts_per_layer - current_experts, 0)
