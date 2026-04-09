@@ -163,13 +163,35 @@ class CDAD(SD_AMN):
         self._finalize_warmup_activations()
         layer_novelty = self._layer_novelty_energy()
         ranked = []
+        diagnostics = {}
         for key, novelty in layer_novelty.items():
             threshold = self._layer_novelty_threshold(key)
+            adapter = self.layer_adapters[key]
+            current = adapter.num_experts
+            raw_request = self._compute_raw_expert_request(novelty, threshold)
+            room = float("inf") if self.max_experts_per_layer is None else max(self.max_experts_per_layer - current, 0)
+            at_cap = (self.max_experts_per_layer is not None and room == 0)
+            diagnostics[key] = {
+                "current_experts": current,
+                "max_experts": self.max_experts_per_layer,
+                "novelty": novelty,
+                "threshold": threshold,
+                "raw_request": raw_request,
+                "room": room,
+                "actual_request": 0,
+                "dropped_by_topk": False,
+                "at_cap": at_cap,
+                "stuck_high_novelty_room0": (novelty > threshold and at_cap),
+            }
             if novelty > threshold:
                 ranked.append((key, novelty, threshold))
         ranked.sort(key=lambda x: x[1], reverse=True)
+        dropped_keys_by_topk = set()
         if self.layer_growth_topk > 0:
+            dropped_keys_by_topk = {key for key, _, _ in ranked[self.layer_growth_topk:]}
             ranked = ranked[:self.layer_growth_topk]
+        for key in dropped_keys_by_topk:
+            diagnostics[key]["dropped_by_topk"] = True
 
         growth_plan = {}
         for key, novelty, threshold in ranked:
@@ -179,6 +201,7 @@ class CDAD(SD_AMN):
             )
             if num_new_experts > 0:
                 growth_plan[key] = num_new_experts
+            diagnostics[key]["actual_request"] = int(max(num_new_experts, 0))
 
         if len(growth_plan) > 0:
             self._append_new_expert_by_plan(growth_plan, trainable=True, freeze_previous=True)
@@ -194,6 +217,29 @@ class CDAD(SD_AMN):
             f"growth_plan={growth_plan}, warmup_batches={self._warmup_batch_count}, "
             f"target_warmup_batches={self._current_warmup_novelty_batches}"
         )
+        self._log_growth_diagnostics(diagnostics)
+
+    def _compute_raw_expert_request(self, novelty, threshold):
+        if novelty <= threshold:
+            return 0
+        step = max(self.novelty_step, 1e-8)
+        return 1 + int((novelty - threshold) / step)
+
+    def _log_growth_diagnostics(self, diagnostics):
+        if len(diagnostics) == 0:
+            self.logger_val.info("[WarmupGrowDiag] no layers had valid novelty statistics.")
+            return
+        for key in sorted(diagnostics.keys()):
+            d = diagnostics[key]
+            max_experts = "None" if d["max_experts"] is None else str(d["max_experts"])
+            self.logger_val.info(
+                f"[WarmupGrowDiag] layer={key} "
+                f"experts={d['current_experts']}/{max_experts} "
+                f"novelty={d['novelty']:.4f} threshold={d['threshold']:.4f} "
+                f"raw_request={d['raw_request']} actual_request={d['actual_request']} "
+                f"dropped_by_topk={d['dropped_by_topk']} at_cap={d['at_cap']} "
+                f"stuck_high_novelty_room0={d['stuck_high_novelty_room0']}"
+            )
 
     def _select_warmup_stat_layers(self):
         adapter_layers = [key.split("::", 1)[-1] for key in self.layer_adapters.keys()]
@@ -311,10 +357,9 @@ class CDAD(SD_AMN):
 
     def _compute_new_experts_from_novelty(self, novelty, current_experts, threshold=None):
         threshold = self.novelty_threshold if threshold is None else float(threshold)
-        if novelty <= threshold:
+        num_new_experts = self._compute_raw_expert_request(novelty, threshold)
+        if num_new_experts <= 0:
             return 0
-        step = max(self.novelty_step, 1e-8)
-        num_new_experts = 1 + int((novelty - threshold) / step)
         num_new_experts = min(num_new_experts, self.max_new_experts_per_task)
 
         if self.max_experts_per_layer is not None:
