@@ -19,7 +19,12 @@ from ldm.util import log_txt_as_img, exists, instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from cdm.vit import *
 from cdm.lora_expert import AdditiveLoRAAdapter
-from cdm.growth_diag import compute_raw_expert_request, build_growth_plan_and_diagnostics, log_growth_diagnostics
+from cdm.growth_diag import (
+    compute_raw_expert_request,
+    build_growth_plan_and_diagnostics,
+    log_growth_diagnostics,
+    log_post_growth,
+)
 
 
 class CDAD(SD_AMN):
@@ -169,6 +174,7 @@ class CDAD(SD_AMN):
             max_experts_per_layer=self.max_experts_per_layer,
             layer_growth_topk=self.layer_growth_topk,
             novelty_step=self.novelty_step,
+            max_new_experts_per_task=self.max_new_experts_per_task,
             layer_threshold_fn=self._layer_novelty_threshold,
             compute_new_experts_fn=self._compute_new_experts_from_novelty,
         )
@@ -188,6 +194,7 @@ class CDAD(SD_AMN):
             f"target_warmup_batches={self._current_warmup_novelty_batches}"
         )
         log_growth_diagnostics(self.logger_val, diagnostics)
+        log_post_growth(self.logger_val, diagnostics, self.layer_adapters)
 
     def _select_warmup_stat_layers(self):
         adapter_layers = [key.split("::", 1)[-1] for key in self.layer_adapters.keys()]
