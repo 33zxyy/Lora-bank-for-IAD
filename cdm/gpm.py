@@ -33,13 +33,13 @@ class CDAD(SD_AMN):
     """
 
     def __init__(self, lora_rank=4, lora_alpha=1.0, orth_lambda=1e-4, novelty_threshold=0.2,
-                 init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=2, novelty_step=0.1,
+                 init_experts=1, max_experts_per_layer=8, max_new_experts_per_task=4, novelty_step=0.1,
                  orth_constraint_mode="soft", adaptive_init_on_task0=False, router_topk=2,
                  warmup_novelty_batches=4, conv_sample_pool_stride=2,
                  conv_sample_max_patches=512, warmup_max_cols_per_layer=2048,
-                 layer_growth_topk=4, highres_threshold_scale=0.8, middle_attn_threshold_scale=1.2,
+                 layer_growth_topk=8, highres_threshold_scale=0.8, middle_attn_threshold_scale=1.2,
                  warmup_stat_layer_keywords=("input_blocks", "middle_block", "output_blocks"),
-                 warmup_stat_max_layers=24, task0_warmup_novelty_batches=2,
+                 warmup_stat_max_layers=24, task0_warmup_novelty_batches=6,
                  control_lr=1e-5, lora_lr=3e-5, router_lr=5e-5,
                  conv_highres_rank=16, attn_middle_rank=8,
                  *args, **kwargs):
@@ -153,8 +153,7 @@ class CDAD(SD_AMN):
         self._warmup_batch_count = 0
         self._current_warmup_novelty_batches = self.warmup_novelty_batches
         if getattr(self, "task_id", 0) == 0:
-            self._current_warmup_novelty_batches = min(self._current_warmup_novelty_batches,
-                                                       self.task0_warmup_novelty_batches)
+            self._current_warmup_novelty_batches = self.task0_warmup_novelty_batches
         self._warmup_done = (self._current_warmup_novelty_batches is None or self._current_warmup_novelty_batches <= 0)
         self._warmup_hook_handle = {}
         if self._warmup_done:
