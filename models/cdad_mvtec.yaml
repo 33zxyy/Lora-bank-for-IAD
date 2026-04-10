@@ -59,7 +59,7 @@ model:
     novelty_threshold: 0.2
     num_timesteps_cond: 1
     orth_lambda: 0.0001
-    orth_constraint_mode: "soft"
+    orth_constraint_mode: "hard"
     scale_factor: 0.18215
     timesteps: 1000
     unet_config:
