@@ -124,6 +124,8 @@ class CDAD(SD_AMN):
         u_prev = adapter.orth_basis(upto=latest_idx)
         if u_prev is None or u_prev.numel() == 0:
             return
+        if u_prev.device != a_latest.device or u_prev.dtype != a_latest.dtype:
+            u_prev = u_prev.to(device=a_latest.device, dtype=a_latest.dtype)
         # Hard subspace parameterization:
         #   P = I - U^T U,  A_new = A_tilde @ P
         proj = (a_latest @ u_prev.t()) @ u_prev
@@ -209,7 +211,7 @@ class CDAD(SD_AMN):
 
                 input_channel = input[0].shape[-1]
 
-                mat = input[0].reshape(-1, input_channel).t().cpu()
+                mat = input[0].reshape(-1, input_channel).t().detach()
 
                 if name in self.act.keys():
                     self.act[name] = torch.cat([self.act[name], mat], dim=1)
@@ -222,9 +224,9 @@ class CDAD(SD_AMN):
                 kernel_size = model.kernel_size[0]
                 stride = model.stride[0]
 
-                mat = F.unfold(input[0], kernel_size=kernel_size, stride=stride, padding=padding).transpose(0,
-                                                                                                            1).reshape(
-                    kernel_size * kernel_size * input_channel, -1).detach().cpu()
+                mat = F.unfold(input[0], kernel_size=kernel_size, stride=stride, padding=padding).transpose(
+                    0, 1
+                ).reshape(kernel_size * kernel_size * input_channel, -1).detach()
 
                 if name in self.act.keys():
                     self.act[name] = torch.cat([self.act[name], mat], dim=1)
@@ -242,12 +244,12 @@ class CDAD(SD_AMN):
     def on_test_batch_end(self, outputs, batch, batch_idx, dataloader_idx):
         if batch_idx % 10 == 0:
             for name, act in self.act.items():
-                U, S, Vh = torch.linalg.svd(act.cuda(), full_matrices=False)
+                U, S, Vh = torch.linalg.svd(act, full_matrices=False)
 
                 sval_total = (S ** 2).sum()
                 sval_ratio = (S ** 2) / sval_total
                 r = max(torch.sum(torch.cumsum(sval_ratio, dim=0) < 0.999), 1)
-                self.act[name] = U[:, :r].cpu()
+                self.act[name] = U[:, :r]
 
     @torch.no_grad()
     def on_test_end(self):

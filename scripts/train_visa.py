@@ -43,7 +43,10 @@ def main(args):
     train_dataset, task_num = VisADataset_cad('train', args.data_path, args.setting)
     test_dataset, _ = VisADataset_cad('test', args.data_path, args.setting)
 
-    for i in range(task_num):
+    if args.start_task < 0 or args.start_task >= task_num:
+        raise ValueError(f"start_task must be in [0, {task_num - 1}], got {args.start_task}")
+
+    for i in range(args.start_task, task_num):
 
         model.set_log_name(log_name + f'/task{i}')
 
@@ -84,6 +87,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--setting", default=1, type=int)
 
+    parser.add_argument("--start_task", default=0, type=int,
+                        help="Task index to start/resume from, e.g., 1 means start from task1.")
+
     parser.add_argument("--seed", default=1, type=int)
 
     parser.add_argument("--batch_size", default=12, type=int)
@@ -99,6 +105,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
-
 
 
