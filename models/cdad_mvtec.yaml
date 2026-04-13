@@ -48,10 +48,10 @@ model:
     log_every_t: 200
     log_name: encoder_decoder_4-23_woTimemb
     lora_alpha: 1.0
-    lora_rank: 16
+    lora_rank: 4
     init_experts: 1
     adaptive_init_on_task0: true
-    max_experts_per_layer: 8
+    max_experts_per_layer: 16
     max_new_experts_per_task: 8
 #    change the num of the workers with your setting change
     novelty_step: 0.1
