@@ -88,13 +88,13 @@ class MVTecDataset_task(Dataset):
 
         transform_fn = transforms.Resize(self.image_size)
 
-        target = cv2.imread(os.path.join(self.root, nsa_filename))
-        target = cv2.cvtColor(target, 4)
+        target = cv2.imread(os.path.join(self.root, source_filename))
+        target = cv2.cvtColor(target, cv2.COLOR_BGR2RGB)
         target = Image.fromarray(target, "RGB")
         target = transform_fn(target)
 
         source = cv2.imread(os.path.join(self.root, nsa_filename))
-        source = cv2.cvtColor(source, 4)
+        source = cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
         source = Image.fromarray(source, "RGB")
         source = transform_fn(source)
 

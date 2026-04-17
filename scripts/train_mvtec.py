@@ -24,13 +24,18 @@ def main(args):
     if args.start_task == 0 and args.resume_path.endswith('base.ckpt'):
         # For fresh starts, allow changing LoRA rank without shape mismatch by
         # skipping persisted LoRA expert tensors from base checkpoints.
-        select_weights = {
-            key: weights[key] for key in weights
-            if ('control_model' not in key
-                and '.experts.' not in key
-                and '.expert_gates.' not in key)
-        }
-        model.load_state_dict(select_weights, strict=False)
+        model_state = model.state_dict()
+        select_weights = {}
+        for key, value in weights.items():
+            if key not in model_state:
+                continue
+            if '.experts.' in key or '.expert_gates.' in key:
+                continue
+            if model_state[key].shape != value.shape:
+                continue
+            select_weights[key] = value
+        missing, unexpected = model.load_state_dict(select_weights, strict=False)
+        print("missing:", len(missing), "unexpected:", len(unexpected))
     else:
         model.load_state_dict(weights, strict=False)
 
