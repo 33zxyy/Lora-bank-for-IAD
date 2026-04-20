@@ -77,7 +77,7 @@ def main(args):
         if not best_model_path:
             raise RuntimeError(f"No best checkpoint found for task {i}.")
         print(f"[Task {i}] load best checkpoint for test: {best_model_path}")
-        model.load_state_dict(load_state_dict(best_model_path, location='cuda'), strict=False)
+        model.load_state_dict(load_state_dict(best_model_path, location='cpu'), strict=False)
 
         # test is used to process gradient projection
         trainer.test(model, dataloaders=gpm_dataloader)

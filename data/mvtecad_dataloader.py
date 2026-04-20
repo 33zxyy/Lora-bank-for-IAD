@@ -61,7 +61,7 @@ class MVTecDataset_task(Dataset):
         possible_indices = [i for i in range(len(self.data)) if self.data[i]['clsname'] == target_label and i != idx]
 
         if not possible_indices:
-            raise ValueError("no possible")
+            return idx
 
         return random.choice(possible_indices)
 
@@ -75,9 +75,9 @@ class MVTecDataset_task(Dataset):
 
         if idx % 2 == 0 and self.type == 'train':
             nsa_idx = self.find_idx(idx)
-            type = 'nsa'
+            sample_type = 'nsa' if nsa_idx != idx else '_nsa'
         else:
-            type = '_nsa'
+            sample_type = '_nsa'
             nsa_idx = idx
 
 
@@ -99,7 +99,7 @@ class MVTecDataset_task(Dataset):
         source = transform_fn(source)
 
         label = item["label"]
-        if type == 'nsa':
+        if sample_type == 'nsa':
             source, mask = patch_ex(np.asarray(target), np.asarray(source), **self.get_nsa_args(item['clsname']))
             mask = (mask[:, :, 0] * 255.0).astype(np.uint8)
         else:
