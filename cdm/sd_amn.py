@@ -1,6 +1,7 @@
 import re
 import torch
 import timm
+import numpy as np
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -108,24 +109,30 @@ class SD_AMN(LatentDiffusion):
         self.manual_backward(loss)
 
         if not self.task_id == 0:
+            def _project_or_zero_grad(param_name, param):
+                if param.grad is None:
+                    return
+                key = sub_(param_name)
+                grad = param.grad.data
+                if key not in self.project.keys() or not re.search(r'\.weight$', param_name):
+                    grad.fill_(0.0)
+                    return
+
+                grad_2d = grad.view(param.shape[0], -1)
+                basis = self.project[key]
+                if basis.device != grad_2d.device or basis.dtype != grad_2d.dtype:
+                    basis = basis.to(device=grad_2d.device, dtype=grad_2d.dtype)
+                if basis.ndim != 2 or basis.shape[0] != grad_2d.shape[1]:
+                    grad.fill_(0.0)
+                    return
+                proj = torch.mm(basis, basis.t())
+                grad.copy_((grad_2d - torch.mm(grad_2d, proj)).view(param.shape))
 
             for name, param in self.control_model.named_parameters():
-                if sub_(name) in self.project.keys() and re.search('.weight', name):
-                    param.grad.data = param.grad.data - torch.mm(param.grad.data.view(param.shape[0], -1),
-                                                                 torch.mm(self.project[sub_(name)],
-                                                                          self.project[sub_(name)].t())).view(
-                        param.shape)
-                else:
-                    param.grad.data.fill_(0.0)
+                _project_or_zero_grad(name, param)
 
             for name, param in self.model.diffusion_model.named_parameters():
-                if sub_(name) in self.project.keys() and re.search('.weight', name):
-                    param.grad.data = (param.grad.data - torch.mm(param.grad.data.view(param.shape[0], -1),
-                                                                  torch.mm(self.project[sub_(name)],
-                                                                           self.project[sub_(name)].t())).view(
-                        param.shape))
-                else:
-                    param.grad.data.fill_(0.0)
+                _project_or_zero_grad(name, param)
 
         opt.step()
 
@@ -183,7 +190,9 @@ class SD_AMN(LatentDiffusion):
         log_metrics(ret_metrics, evl_metrics)
         auroc_px = ret_metrics['mean_pixel_auc']
         auroc_sp = ret_metrics['mean_max_auc']
-        val_acc = auroc_px + auroc_sp
+        val_acc = float(auroc_px + auroc_sp)
+        if not np.isfinite(val_acc):
+            val_acc = 0.0
         self.log('val_acc', val_acc, on_epoch=True, prog_bar=True, logger=True)
         if val_acc > self.max_check:
             self.max_check = val_acc
