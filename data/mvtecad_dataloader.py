@@ -61,7 +61,7 @@ class MVTecDataset_task(Dataset):
         possible_indices = [i for i in range(len(self.data)) if self.data[i]['clsname'] == target_label and i != idx]
 
         if not possible_indices:
-            raise ValueError("no possible")
+            return idx
 
         return random.choice(possible_indices)
 
@@ -75,9 +75,9 @@ class MVTecDataset_task(Dataset):
 
         if idx % 2 == 0 and self.type == 'train':
             nsa_idx = self.find_idx(idx)
-            type = 'nsa'
+            sample_type = 'nsa' if nsa_idx != idx else '_nsa'
         else:
-            type = '_nsa'
+            sample_type = '_nsa'
             nsa_idx = idx
 
 
@@ -88,18 +88,18 @@ class MVTecDataset_task(Dataset):
 
         transform_fn = transforms.Resize(self.image_size)
 
-        target = cv2.imread(os.path.join(self.root, nsa_filename))
-        target = cv2.cvtColor(target, 4)
+        target = cv2.imread(os.path.join(self.root, source_filename))
+        target = cv2.cvtColor(target, cv2.COLOR_BGR2RGB)
         target = Image.fromarray(target, "RGB")
         target = transform_fn(target)
 
         source = cv2.imread(os.path.join(self.root, nsa_filename))
-        source = cv2.cvtColor(source, 4)
+        source = cv2.cvtColor(source, cv2.COLOR_BGR2RGB)
         source = Image.fromarray(source, "RGB")
         source = transform_fn(source)
 
         label = item["label"]
-        if type == 'nsa':
+        if sample_type == 'nsa':
             source, mask = patch_ex(np.asarray(target), np.asarray(source), **self.get_nsa_args(item['clsname']))
             mask = (mask[:, :, 0] * 255.0).astype(np.uint8)
         else:
